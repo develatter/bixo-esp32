@@ -108,6 +108,12 @@ public:
      */
     void StopListening();
 
+    /**
+     * Start a conversation, or end the current one (thread-safe)
+     * Opens the audio channel and listens until StopListening(), or closes the channel
+     */
+    void ToggleConversation();
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");

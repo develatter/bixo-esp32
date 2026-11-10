@@ -2,7 +2,6 @@
 #include "board.h"
 #include "config.h"
 #include "lvgl_display.h"
-#include "lvgl_image.h"
 #include "mcp_server.h"
 #include "settings.h"
 #include "system_info.h"
@@ -44,7 +43,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
     spi_io_config.pclk_hz = BSP_SSCMA_CLIENT_SPI_CLK;
     spi_io_config.spi_mode = 0;
     spi_io_config.wait_delay =
-        10;  // 两个transfer之间至少延时4ms,但当前 FREERTOS_HZ=100, 延时精度只能达到10ms,
+        10;  // At least 4ms is needed between two transfers, but FREERTOS_HZ=100 currently limits delay precision to 10ms,
     spi_io_config.user_ctx = NULL;
     spi_io_config.io_expander = io_exp_handle;
     spi_io_config.flags.sync_use_expander = BSP_SSCMA_CLIENT_RST_USE_EXPANDER;
@@ -107,10 +106,10 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                 bool is_object_detected = false;
                 bool is_need_wake = false;
 
-                // 定期更新检测配置参数，避免频繁NVS访问
+                // Update detection config periodically to avoid frequent NVS access
                 int64_t cur_tm = esp_timer_get_time();
 
-                // 尝试获取检测框数据（目标检测模型）
+                // Try to get bounding-box data (object detection model)
                 if (sscma_utils_fetch_boxes_from_reply(reply, &boxes, &box_count) == ESP_OK &&
                     box_count > 0) {
                     for (int i = 0; i < box_count; i++) {
@@ -129,7 +128,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                 } else if (sscma_utils_fetch_classes_from_reply(reply, &classes, &class_count) ==
                                ESP_OK &&
                            class_count > 0) {
-                    // 尝试获取分类数据（分类模型）
+                    // Try to get classification data (classification model)
                     for (int i = 0; i < class_count; i++) {
                         ESP_LOGI(TAG, "[class %d]: target=%d, score=%d", i, classes[i].target,
                                  classes[i].score);
@@ -144,7 +143,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                 } else if (sscma_utils_fetch_points_from_reply(reply, &points, &point_count) ==
                                ESP_OK &&
                            point_count > 0) {
-                    // 尝试获取关键点数据（姿态估计模型）
+                    // Try to get keypoint data (pose estimation model)
                     for (int i = 0; i < point_count; i++) {
                         ESP_LOGI(TAG, "[point %d]: x=%d, y=%d, z=%d, score=%d, target=%d", i,
                                  points[i].x, points[i].y, points[i].z, points[i].score,
@@ -159,40 +158,40 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                     free(points);
                 }
 
-                // 如果需要开始冷却期，现在开始计时
-                if (self->need_start_cooldown) {  // 回调暂停，标志保持，等待回调恢复后开始计时
+                // If a cooldown period needs to start, start timing now
+                if (self->need_start_cooldown) {  // callback paused; keep the flag and start timing once the callback resumes
                     self->state_start_time = cur_tm;
                     self->need_start_cooldown = false;
                     ESP_LOGI(TAG, "Starting cooldown timer");
                 }
 
-                // 状态机驱动的检测逻辑 - 只在人员出现时触发
+                // State-machine-driven detection logic - triggers only when a person appears
                 switch (self->detection_state) {
                     case SscmaCamera::IDLE:
                         if (is_object_detected) {
-                            // 人员出现，开始验证（这是从无到有的转换）
+                            // Person appeared, start validating (this is the none-to-present transition)
                             self->detection_state = SscmaCamera::VALIDATING;
-                            self->state_start_time = cur_tm;    // 记录物体出现时间
-                            self->last_detected_time = cur_tm;  // 初始化最后检测时间
+                            self->state_start_time = cur_tm;    // record the time the object appeared
+                            self->last_detected_time = cur_tm;  // initialize the last detection time
                             ESP_LOGI(TAG, "object appeared, starting validation");
                         }
                         break;
 
                     case SscmaCamera::VALIDATING:
                         if (is_object_detected) {
-                            // 更新最后检测到的时间
+                            // Update the last detection time
                             self->last_detected_time = cur_tm;
-                            // 检查是否验证足够时间
+                            // Check whether validation has lasted long enough
                             if ((cur_tm - self->state_start_time) >=
                                 (self->detect_duration_sec * 1000000)) {
                                 is_need_wake = true;
                             }
                         } else {
-                            // 验证期间人员离开，检查去抖动时间
+                            // Person left during validation, check the debounce time
                             if (self->last_detected_time > 0 &&
                                 (cur_tm - self->last_detected_time) >=
                                     self->detect_debounce_sec * 1000000LL) {
-                                // 去抖动时间已过，确认人员已离开，回到空闲
+                                // Debounce time elapsed, person confirmed gone, return to idle
                                 self->detection_state = SscmaCamera::IDLE;
                                 self->last_detected_time = 0;
                                 ESP_LOGI(TAG,
@@ -202,17 +201,17 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                         break;
 
                     case SscmaCamera::COOLDOWN:
-                        // 冷却期，需要满足两个条件：1)object离开 2)过了15秒
+                        // Cooldown: two conditions must be met: 1) the object has left 2) detect_invoke_interval_sec has passed
                         if (!is_object_detected &&
                             (cur_tm - self->state_start_time) >=
                                 (self->detect_invoke_interval_sec * 1000000LL)) {
-                            // object离开且冷却时间到，回到空闲状态
+                            // Object left and cooldown elapsed, return to idle
                             self->detection_state = SscmaCamera::IDLE;
                             ESP_LOGI(TAG,
                                      "Cooldown complete and object left, back to idle - ready for "
                                      "next appearance");
                         }
-                        // 其他情况继续保持冷却状态
+                        // Otherwise stay in cooldown
                         break;
                 }
 
@@ -221,7 +220,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                              "Validation complete, triggering conversation (type=%d, res=%dx%d)",
                              self->detect_target, width, height);
 
-                    // 触发对话
+                    // Trigger a conversation
                     std::string wake_word;
                     if (model_type == 0) {
                         std::string cached_target_name = "object";
@@ -251,7 +250,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                     printf("wake_word:%s\n", wake_word.c_str());
                     Application::GetInstance().WakeWordInvoke(wake_word);
 
-                    // 进入冷却状态，标记需要开始冷却期；如下变量将在会话结束后被使用，等待回调恢复后开始计时
+                    // Enter cooldown and mark that the cooldown period needs to start; the variables below are used after the session ends, timing starts once the callback resumes
                     self->detection_state = SscmaCamera::COOLDOWN;
                     self->need_start_cooldown = true;
                 }
@@ -260,12 +259,12 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
 
                 if (sscma_utils_fetch_image_from_reply(reply, &img, &img_size) == ESP_OK) {
                     ESP_LOGI(TAG, "image_size: %d\n", img_size);
-                    // 将数据通过队列发送出去
+                    // Send the data out through the queue
                     SscmaData data;
                     data.img = (uint8_t*)img;
                     data.len = img_size;
 
-                    // 清空队列，保证只保存最新的数据
+                    // Clear the queue so only the latest data is kept
                     SscmaData dummy;
                     while (xQueueReceive(self->sscma_data_queue_, &dummy, 0) == pdPASS) {
                         if (dummy.img) {
@@ -273,7 +272,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                         }
                     }
                     xQueueSend(self->sscma_data_queue_, &data, 0);
-                    // 注意：img 的释放由接收方负责
+                    // Note: the receiver is responsible for freeing img
                 }
                 break;
             default:
@@ -298,7 +297,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
     sscma_client_init(sscma_client_handle_);
 
     ESP_LOGI(TAG, "SSCMA client initialized");
-    // 设置分辨率
+    // Set the resolution
     // 3 = 640x480
     if (sscma_client_set_sensor(sscma_client_handle_, 1, 3, true)) {
         ESP_LOGE(TAG, "Failed to set sensor");
@@ -307,61 +306,18 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
         return;
     }
 
-    // 获取设备信息
+    // Get device info
     sscma_client_info_t* info;
     if (sscma_client_get_info(sscma_client_handle_, &info, true) == ESP_OK) {
         ESP_LOGI(TAG, "Device Info - ID: %s, Name: %s", info->id ? info->id : "NULL",
                  info->name ? info->name : "NULL");
     }
-    // 初始化JPEG数据的内存
+    // Initialize memory for the JPEG data
     jpeg_data_.len = 0;
     jpeg_data_.buf = (uint8_t*)heap_caps_malloc(IMG_JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM);
     ;
     if (jpeg_data_.buf == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate memory for JPEG buffer");
-        return;
-    }
-
-    // 初始化JPEG解码
-    jpeg_error_t err;
-    jpeg_dec_config_t config = {.output_type = JPEG_PIXEL_FORMAT_RGB565_LE,
-                                .rotate = JPEG_ROTATE_0D};
-    err = jpeg_dec_open(&config, &jpeg_dec_);
-    if (err != JPEG_ERR_OK) {
-        ESP_LOGE(TAG, "Failed to open JPEG decoder");
-        return;
-    }
-    jpeg_io_ = (jpeg_dec_io_t*)heap_caps_malloc(sizeof(jpeg_dec_io_t), MALLOC_CAP_SPIRAM);
-    if (!jpeg_io_) {
-        ESP_LOGE(TAG, "Failed to allocate memory for JPEG IO");
-        jpeg_dec_close(jpeg_dec_);
-        return;
-    }
-    memset(jpeg_io_, 0, sizeof(jpeg_dec_io_t));
-
-    jpeg_out_ = (jpeg_dec_header_info_t*)heap_caps_aligned_alloc(16, sizeof(jpeg_dec_header_info_t),
-                                                                 MALLOC_CAP_SPIRAM);
-    if (!jpeg_out_) {
-        ESP_LOGE(TAG, "Failed to allocate memory for JPEG output header");
-        heap_caps_free(jpeg_io_);
-        jpeg_dec_close(jpeg_dec_);
-        return;
-    }
-    memset(jpeg_out_, 0, sizeof(jpeg_dec_header_info_t));
-
-    // 初始化预览图片的内存
-    memset(&preview_image_, 0, sizeof(preview_image_));
-    preview_image_.header.magic = LV_IMAGE_HEADER_MAGIC;
-    preview_image_.header.cf = LV_COLOR_FORMAT_RGB565;
-    preview_image_.header.flags = LV_IMAGE_FLAGS_ALLOCATED | LV_IMAGE_FLAGS_MODIFIABLE;
-    preview_image_.header.w = 640;
-    preview_image_.header.h = 480;
-
-    preview_image_.header.stride = preview_image_.header.w * 2;
-    preview_image_.data_size = preview_image_.header.w * preview_image_.header.h * 2;
-    preview_image_.data = (uint8_t*)jpeg_calloc_align(preview_image_.data_size, 16);
-    if (preview_image_.data == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate memory for preview image");
         return;
     }
 
@@ -418,7 +374,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                         sscma_client_break(this_->sscma_client_handle_);
                         sscma_client_set_model(this_->sscma_client_handle_, 4);
                         sscma_client_set_sensor(this_->sscma_client_handle_, 1, 1,
-                                                true);  // 设置分辨率 416X416
+                                                true);  // Set resolution to 416X416
                         sscma_client_invoke(this_->sscma_client_handle_, -1, false, true);
                         is_inference = true;
                     }
@@ -437,10 +393,6 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
 }
 
 SscmaCamera::~SscmaCamera() {
-    if (preview_image_.data) {
-        heap_caps_free((void*)preview_image_.data);
-        preview_image_.data = nullptr;
-    }
     if (sscma_client_handle_) {
         sscma_client_del(sscma_client_handle_);
     }
@@ -450,18 +402,6 @@ SscmaCamera::~SscmaCamera() {
     if (jpeg_data_.buf) {
         heap_caps_free(jpeg_data_.buf);
         jpeg_data_.buf = nullptr;
-    }
-    if (jpeg_dec_) {
-        jpeg_dec_close(jpeg_dec_);
-        jpeg_dec_ = nullptr;
-    }
-    if (jpeg_io_) {
-        heap_caps_free(jpeg_io_);
-        jpeg_io_ = nullptr;
-    }
-    if (jpeg_out_) {
-        heap_caps_free(jpeg_out_);
-        jpeg_out_ = nullptr;
     }
 }
 
@@ -474,14 +414,14 @@ void SscmaCamera::InitializeMcpTools() {
     inference_en = settings.GetInt("enable", 0);
 
     auto& mcp_server = McpServer::GetInstance();
-    // 获取模型参数配置
+    // Get model parameter config
     mcp_server.AddTool("self.model.param_get",
-                       "获取当前视觉模型检测的参数配置信息。\n"
-                       "返回结果包含：\n"
-                       "  `threshold`: 检测置信度阈值 (0-100)，低于此值的检测结果将被忽略；\n"
-                       "  `interval`: 触发对话后的冷却时间(秒)，防止频繁打断；\n"
-                       "  `duration`: 持续检测确认时间(秒)；\n"
-                       "  `target`: 当前关注的检测目标索引。",
+                       "Get the current detection parameter config of the vision model.\n"
+                       "The result contains:\n"
+                       "  `threshold`: Detection confidence threshold (0-100); detections below it are ignored;\n"
+                       "  `interval`: Cooldown (seconds) after a conversation is triggered, to prevent frequent interruptions;\n"
+                       "  `duration`: Time (seconds) a detection must persist to be confirmed;\n"
+                       "  `target`: Index of the detection target currently watched.",
                        PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
                            Settings settings("model", false);
                            int threshold = settings.GetInt("threshold", 75);
@@ -497,15 +437,15 @@ void SscmaCamera::InitializeMcpTools() {
                            return result;
                        });
 
-    // 设置模型参数配置
+    // Set model parameter config
     mcp_server.AddTool(
         "self.model.param_set",
-        "配置视觉模型检测参数。当用户希望调整检测灵敏度、频率或特定目标时使用。\n"
-        "参数(均为可选，未提供的参数将保持当前设置不变)：\n"
-        "  `threshold`: 置信度阈值 (0-100)。提高此值可减少误报，但可能漏检；\n"
-        "  `interval`: 冷却时间(秒)。设置对话结束后多久内不再触发检测；\n"
-        "  `duration`: 持续检测时间(秒)。\n"
-        "  `target`: 设置检测目标的索引 ID。",
+        "Configure the vision model detection parameters. Use when the user wants to adjust detection sensitivity, frequency or a specific target.\n"
+        "Parameters (all optional; omitted ones keep their current setting):\n"
+        "  `threshold`: Confidence threshold (0-100). Raising it reduces false positives but may miss detections;\n"
+        "  `interval`: Cooldown (seconds). How long after a conversation ends detection will not trigger again;\n"
+        "  `duration`: Time (seconds) a detection must persist.\n"
+        "  `target`: Index ID of the detection target to set.",
         PropertyList({Property("threshold", kPropertyTypeInteger, -1, -1, 100),
                       Property("interval", kPropertyTypeInteger, -1, -1, 60),
                       Property("duration", kPropertyTypeInteger, -1, -1, 60),
@@ -543,13 +483,13 @@ void SscmaCamera::InitializeMcpTools() {
             return "{\"status\": \"success\", \"message\": \"Detection configuration updated\"}";
         });
 
-    // 推理开关获取
+    // Get the inference switch
     mcp_server.AddTool(
         "self.model.enable",
-        "控制视觉推理(摄像头检测)功能的开启与关闭，或查询当前状态。\n"
-        "当用户指令涉及'开启/关闭推理'、'开始/停止检测'时使用。\n"
-        "参数：\n"
-        "  `enable`: (可选) 整数。1=开启推理，0=关闭推理。若省略则返回当前开关状态。",
+        "Turn visual inference (camera detection) on or off, or query the current state.\n"
+        "Use when the user's request involves 'enable/disable inference' or 'start/stop detection'.\n"
+        "Parameters:\n"
+        "  `enable`: (optional) Integer. 1=enable inference, 0=disable inference. If omitted, returns the current switch state.",
         PropertyList({Property("enable", kPropertyTypeInteger, inference_en, 0, 1)}),
         [this](const PropertyList& properties) -> ReturnValue {
             Settings settings("model", true);
@@ -557,7 +497,7 @@ void SscmaCamera::InitializeMcpTools() {
             settings.SetInt("enable", en);
             this->inference_en = en;
             ESP_LOGI(TAG, "Set inference enable to %d", en);
-            // 返回当前配置
+            // Return the current config
             int cur_en = settings.GetInt("enable", this->inference_en);
             return std::string("{\"enable\":") + std::to_string(cur_en) + "}";
         });
@@ -582,12 +522,12 @@ bool SscmaCamera::Capture() {
         return false;
     }
     ESP_LOGI(TAG, "Capturing image...");
-    // himax 可能有缓存数据, 只获取最新的照片即可.
+    // himax may have buffered data; only the latest photo is needed.
     if (sscma_client_sample(sscma_client_handle_, 1)) {
         ESP_LOGE(TAG, "Failed to capture image from SSCMA client");
         return false;
     }
-    vTaskDelay(pdMS_TO_TICKS(500));  // 等待SSCMA客户端处理数据
+    vTaskDelay(pdMS_TO_TICKS(500));  // wait for the SSCMA client to process the data
     if (xQueueReceive(sscma_data_queue_, &data, pdMS_TO_TICKS(1000)) != pdPASS) {
         ESP_LOGE(TAG, "Failed to receive JPEG data from SSCMA client");
         return false;
@@ -608,47 +548,6 @@ bool SscmaCamera::Capture() {
     }
     heap_caps_free(data.img);
 
-    // DECODE JPEG
-    if (!jpeg_dec_ || !jpeg_io_ || !jpeg_out_ || !preview_image_.data) {
-        return true;
-    }
-    jpeg_io_->inbuf = jpeg_data_.buf;
-    jpeg_io_->inbuf_len = jpeg_data_.len;
-    ret = jpeg_dec_parse_header(jpeg_dec_, jpeg_io_, jpeg_out_);
-    if (ret < 0) {
-        ESP_LOGE(TAG, "Failed to parse JPEG header, ret: %d", ret);
-        return true;
-    }
-    jpeg_io_->outbuf = (unsigned char*)preview_image_.data;
-    int inbuf_consumed = jpeg_io_->inbuf_len - jpeg_io_->inbuf_remain;
-    jpeg_io_->inbuf = jpeg_data_.buf + inbuf_consumed;
-    jpeg_io_->inbuf_len = jpeg_io_->inbuf_remain;
-
-    ret = jpeg_dec_process(jpeg_dec_, jpeg_io_);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to decode JPEG image, ret: %d", ret);
-        return true;
-    }
-
-    // 显示预览图片
-    auto display = Board::GetInstance().GetDisplay();
-    if (display != nullptr) {
-        uint16_t w = preview_image_.header.w;
-        uint16_t h = preview_image_.header.h;
-        size_t image_size = w * h * 2;
-        size_t stride = preview_image_.header.w * 2;
-
-        uint8_t* data = (uint8_t*)heap_caps_malloc(image_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (data == nullptr) {
-            ESP_LOGE(TAG, "Failed to allocate memory for display image");
-            return true;
-        }
-        memcpy(data, preview_image_.data, image_size);
-
-        auto image = std::make_unique<LvglAllocatedImage>(data, image_size, w, h, stride,
-                                                          LV_COLOR_FORMAT_RGB565);
-        display->SetPreviewImage(std::move(image));
-    }
     return true;
 }
 bool SscmaCamera::SetHMirror(bool enabled) { return false; }
@@ -656,18 +555,18 @@ bool SscmaCamera::SetHMirror(bool enabled) { return false; }
 bool SscmaCamera::SetVFlip(bool enabled) { return false; }
 
 /**
- * @brief 将摄像头捕获的图像发送到远程服务器进行AI分析和解释
+ * @brief Send the image captured by the camera to a remote server for AI analysis and explanation
  *
- * 该函数将当前摄像头缓冲区中的图像编码为JPEG格式，并通过HTTP POST请求
- * 以multipart/form-data的形式发送到指定的解释服务器。服务器将根据提供的
- * 问题对图像进行AI分析并返回结果。
+ * This function encodes the image in the current camera buffer as JPEG and sends it via an HTTP POST request
+ * as multipart/form-data to the specified explain server. The server analyzes the image
+ * with AI based on the provided question and returns the result.
  *
- * @param question 要向AI提出的关于图像的问题，将作为表单字段发送
- * @return 成功时返回服务器的 JSON 响应，失败时返回可读错误信息
+ * @param question The question to ask the AI about the image, sent as a form field
+ * @return On success, the server's JSON response; on failure, a readable error message
  *
- * @note 调用此函数前必须先调用SetExplainUrl()设置服务器URL
- * @note 函数会等待之前的编码线程完成后再开始新的处理
- * @warning 如果摄像头缓冲区为空或网络连接失败，将返回错误信息
+ * @note SetExplainUrl() must be called first to set the server URL
+ * @note The function waits for the previous encoding thread to finish before starting new processing
+ * @warning If the camera buffer is empty or the network connection fails, an error message is returned
  */
 std::expected<std::string, std::string> SscmaCamera::Explain(const std::string& question) {
     if (explain_url_.empty()) {
@@ -676,28 +575,28 @@ std::expected<std::string, std::string> SscmaCamera::Explain(const std::string& 
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(3);
-    // 构造multipart/form-data请求体
+    // Build the multipart/form-data request body
     std::string boundary = "----ESP32_CAMERA_BOUNDARY";
 
-    // 构造question字段
+    // Build the question field
     std::string question_field;
     question_field += "--" + boundary + "\r\n";
     question_field += "Content-Disposition: form-data; name=\"question\"\r\n";
     question_field += "\r\n";
     question_field += question + "\r\n";
 
-    // 构造文件字段头部
+    // Build the file field header
     std::string file_header;
     file_header += "--" + boundary + "\r\n";
     file_header += "Content-Disposition: form-data; name=\"file\"; filename=\"camera.jpg\"\r\n";
     file_header += "Content-Type: image/jpeg\r\n";
     file_header += "\r\n";
 
-    // 构造尾部
+    // Build the footer
     std::string multipart_footer;
     multipart_footer += "\r\n--" + boundary + "--\r\n";
 
-    // 配置HTTP客户端，使用分块传输编码
+    // Configure the HTTP client to use chunked transfer encoding
     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     http->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
     if (!explain_token_.empty()) {
@@ -718,31 +617,31 @@ std::expected<std::string, std::string> SscmaCamera::Explain(const std::string& 
         return false;
     };
 
-    // 第一块：question字段
+    // Chunk 1: question field
     if (write_or_fail(question_field.c_str(), question_field.size())) {
         http->Close();
         return std::unexpected("Failed to upload photo");
     }
 
-    // 第二块：文件字段头部
+    // Chunk 2: file field header
     if (write_or_fail(file_header.c_str(), file_header.size())) {
         http->Close();
         return std::unexpected("Failed to upload photo");
     }
 
-    // 第三块：JPEG数据
+    // Chunk 3: JPEG data
     if (write_or_fail((const char*)jpeg_data_.buf, jpeg_data_.len)) {
         http->Close();
         return std::unexpected("Failed to upload photo");
     }
 
-    // 第四块：multipart尾部
+    // Chunk 4: multipart footer
     if (write_or_fail(multipart_footer.c_str(), multipart_footer.size())) {
         http->Close();
         return std::unexpected("Failed to upload photo");
     }
 
-    // 结束块
+    // End chunk
     if (write_or_fail("", 0)) {
         http->Close();
         return std::unexpected("Failed to upload photo");

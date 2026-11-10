@@ -1,174 +1,135 @@
-# An MCP-based Chatbot
+<div align="center">
 
-(English | [中文](README_zh.md) | [日本語](README_ja.md))
+<img src="docs/img/screen_happy.gif" width="200" alt="Bixo contento">
 
-## Introduction
+# bixo-esp32
 
-👉 [Human: Give AI a camera vs AI: Instantly finds out the owner hasn't washed hair for three days【bilibili】](https://www.bilibili.com/video/BV1bpjgzKEhd/)
+**Bixo es una mascota virtual con IA que vive en un [SenseCAP Watcher](https://www.seeedstudio.com/watcher).**<br>
+Le hablas, te contesta, te mira con su cámara y pone caras.
 
-👉 [Handcraft your AI girlfriend, beginner's guide【bilibili】](https://www.bilibili.com/video/BV1XnmFYLEJN/)
+![ESP32-S3](https://img.shields.io/badge/ESP32--S3-SenseCAP%20Watcher-4080FA)
+![ESP-IDF 6.1](https://img.shields.io/badge/ESP--IDF-6.1-2BD5FF)
+![Licencia MIT](https://img.shields.io/badge/licencia-MIT-6E7FAF)
 
-As a voice interaction entry, the XiaoZhi AI chatbot leverages the AI capabilities of large models like Qwen / DeepSeek, and achieves multi-terminal control via the MCP protocol.
+<img src="docs/img/screen_neutral.gif" width="110"> <img src="docs/img/screen_loving.gif" width="110"> <img src="docs/img/screen_laughing.gif" width="110"> <img src="docs/img/screen_sleepy.gif" width="110"> <img src="docs/img/screen_no_wifi.gif" width="110">
 
-<img src="docs/mcp-based-graph.jpg" alt="Control everything via MCP" width="320">
-
-## Recent Updates
-
-- The project now requires ESP-IDF v6.0.1 or later. [ESP-IDF `release/v6.1`](https://github.com/espressif/esp-idf/tree/release/v6.1) is the recommended SDK branch. ESP-IDF 5.x is no longer supported. The current matrix contains 171 variants; ESP32-S31 builds require IDF 6.1 or later.
-- MQTT and BluFi cryptographic code has migrated to PSA Crypto. IDF 6 component splits and third-party dependency compatibility have also been addressed.
-- Audio pipeline concurrency, MQTT/UDP packet validation, and release-matrix selection have been hardened.
-- ESP32-P4 Rev1 and Rev3 are both supported on IDF 6 with ESP-SR 2.4.7.
-
-### Features Implemented
-
-- Wi-Fi, wired Ethernet, USB RNDIS, and ML307/EC801E or NT26 Cat.1 4G networking; supported boards can switch between Wi-Fi and 4G
-- Offline voice wake-up with [ESP-SR](https://github.com/espressif/esp-sr), including customizable wake words
-- Two communication transports: [WebSocket](docs/websocket.md) and [MQTT + UDP](docs/mqtt-udp.md)
-- Opus audio streaming with conventional streaming ASR + LLM + TTS pipelines and Realtime end-to-end voice models; AEC-capable hardware supports realtime full-duplex interaction
-- Speaker recognition, identifies the current speaker [3D Speaker](https://github.com/modelscope/3D-Speaker)
-- OLED / LCD displays with emoji and rich expression support, plus camera vision input on supported boards
-- Battery display and power management
-- 39 interface languages, with localized voice prompts where available and English fallback
-- ESP32, ESP32-C3, ESP32-C5, ESP32-C6, ESP32-S3, and ESP32-P4 chip platforms
-- Wi-Fi provisioning through hotspot or BluFi
-- Device-side MCP for device control (Speaker, LED, Servo, GPIO, etc.)
-- Cloud-side MCP to extend large model capabilities (smart home control, PC desktop operation, knowledge search, email, etc.)
-- Customizable wake words, fonts, emojis, and chat backgrounds with online web-based editing ([Custom Assets Generator](https://github.com/78/xiaozhi-assets-generator))
-
-## Hardware
-
-### Breadboard DIY Practice
-
-See the Feishu document tutorial:
-
-👉 ["XiaoZhi AI Chatbot Encyclopedia"](https://ccnphfhqs21z.feishu.cn/wiki/F5krwD16viZoF0kKkvDcrZNYnhb?from=from_copylink)
-
-Breadboard demo:
-
-![Breadboard Demo](docs/v1/wiring2.jpg)
-
-### Supports 138 Board Directories and 171 Release Variants (Partial List)
-
-- <a href="https://oshwhub.com/li-chuang-kai-fa-ban/li-chuang-shi-zhan-pai-esp32-s3-kai-fa-ban" target="_blank" title="LiChuang ESP32-S3 Development Board">LiChuang ESP32-S3 Development Board</a>
-- <a href="https://github.com/espressif/esp-box" target="_blank" title="Espressif ESP32-S3-BOX-3">Espressif ESP32-S3-BOX-3</a>
-- <a href="https://docs.m5stack.com/zh_CN/core/CoreS3" target="_blank" title="M5Stack CoreS3">M5Stack CoreS3</a>
-- <a href="https://docs.m5stack.com/en/atom/Atomic%20Echo%20Base" target="_blank" title="AtomS3R + Echo Base">M5Stack AtomS3R + Echo Base</a>
-- <a href="https://gf.bilibili.com/item/detail/1108782064" target="_blank" title="Magic Button 2.4">Magic Button 2.4</a>
-- <a href="https://www.waveshare.net/shop/ESP32-S3-Touch-AMOLED-1.8.htm" target="_blank" title="Waveshare ESP32-S3-Touch-AMOLED-1.8">Waveshare ESP32-S3-Touch-AMOLED-1.8</a>
-- <a href="https://github.com/Xinyuan-LilyGO/T-Circle-S3" target="_blank" title="LILYGO T-Circle-S3">LILYGO T-Circle-S3</a>
-- <a href="https://oshwhub.com/tenclass01/xmini_c3" target="_blank" title="XiaGe Mini C3">XiaGe Mini C3</a>
-- <a href="https://oshwhub.com/movecall/cuican-ai-pendant-lights-up-y" target="_blank" title="Movecall CuiCan ESP32S3">CuiCan AI Pendant</a>
-- <a href="https://github.com/WMnologo/xingzhi-ai" target="_blank" title="WMnologo-Xingzhi-1.54">WMnologo-Xingzhi-1.54TFT</a>
-- <a href="https://www.seeedstudio.com/SenseCAP-Watcher-W1-A-p-5979.html" target="_blank" title="SenseCAP Watcher">SenseCAP Watcher</a>
-- <a href="https://www.bilibili.com/video/BV1BHJtz6E2S/" target="_blank" title="ESP-HI Low Cost Robot Dog">ESP-HI Low Cost Robot Dog</a>
-
-<div style="display: flex; justify-content: space-between;">
-  <a href="docs/v1/lichuang-s3.jpg" target="_blank" title="LiChuang ESP32-S3 Development Board">
-    <img src="docs/v1/lichuang-s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/espbox3.jpg" target="_blank" title="Espressif ESP32-S3-BOX3">
-    <img src="docs/v1/espbox3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/m5cores3.jpg" target="_blank" title="M5Stack CoreS3">
-    <img src="docs/v1/m5cores3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/atoms3r.jpg" target="_blank" title="AtomS3R + Echo Base">
-    <img src="docs/v1/atoms3r.jpg" width="240" />
-  </a>
-  <a href="docs/v1/magiclick.jpg" target="_blank" title="Magic Button 2.4">
-    <img src="docs/v1/magiclick.jpg" width="240" />
-  </a>
-  <a href="docs/v1/waveshare.jpg" target="_blank" title="Waveshare ESP32-S3-Touch-AMOLED-1.8">
-    <img src="docs/v1/waveshare.jpg" width="240" />
-  </a>
-  <a href="docs/v1/lilygo-t-circle-s3.jpg" target="_blank" title="LILYGO T-Circle-S3">
-    <img src="docs/v1/lilygo-t-circle-s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/xmini-c3.jpg" target="_blank" title="XiaGe Mini C3">
-    <img src="docs/v1/xmini-c3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/movecall-cuican-esp32s3.jpg" target="_blank" title="CuiCan">
-    <img src="docs/v1/movecall-cuican-esp32s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/wmnologo_xingzhi_1.54.jpg" target="_blank" title="WMnologo-Xingzhi-1.54">
-    <img src="docs/v1/wmnologo_xingzhi_1.54.jpg" width="240" />
-  </a>
-  <a href="docs/v1/sensecap_watcher.jpg" target="_blank" title="SenseCAP Watcher">
-    <img src="docs/v1/sensecap_watcher.jpg" width="240" />
-  </a>
-  <a href="docs/v1/esp-hi.jpg" target="_blank" title="ESP-HI Low Cost Robot Dog">
-    <img src="docs/v1/esp-hi.jpg" width="240" />
-  </a>
 </div>
 
-## Software
+Aquí está Bixo entero:
 
-### Firmware Flashing
+- **El cuerpo:** el firmware del Watcher, con micrófono, altavoz, pantalla redonda, rueda,
+  pantalla táctil y cámara. Es un fork de [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)
+  recortado a esta única placa.
+- **El cerebro,** en [`server/`](server): el servidor de voz con IA, y los sprites y fondos
+  que se graban en el Watcher.
 
-For beginners, it is recommended to use the firmware that can be flashed without setting up a development environment.
+## Cómo es
 
-The firmware connects to the official [xiaozhi.me](https://xiaozhi.me) server by default. Personal users can register an account to use the Qwen real-time model for free.
+### Solo Bixo en pantalla
 
-👉 [Beginner's Firmware Flashing Guide](https://ccnphfhqs21z.feishu.cn/wiki/Zpz4wXBtdimBrLk25WdcXzxcnNS)
+Sin hora, sin iconos. Bixo aparece centrado y lo que le pasa al aparato se le nota a él:
 
-### Development Environment
+| Batería llena | Menos del 50 % | Menos del 35 % | Menos del 20 % | Casi sin batería |
+|:---:|:---:|:---:|:---:|:---:|
+| <img src="docs/img/battery_neutral.png" width="110"> | <img src="docs/img/battery_neutral_g1.png" width="110"> | <img src="docs/img/battery_neutral_g2.png" width="110"> | <img src="docs/img/battery_neutral_g3.png" width="110"> | <img src="docs/img/battery_exhausted.png" width="110"> |
 
-- Cursor or VSCode
-- Install the ESP-IDF plugin. The minimum SDK is [ESP-IDF v6.0.1](https://github.com/espressif/esp-idf/releases/tag/v6.0.1); [ESP-IDF `release/v6.1`](https://github.com/espressif/esp-idf/tree/release/v6.1) is recommended. ESP-IDF 5.x is not supported.
-- Linux is better than Windows for faster compilation and fewer driver issues
-- This project uses Google C++ code style, please ensure compliance when submitting code
+Sin conexión, busca el wifi con un icono tachado sobre la cabeza. Si le tocas, reacciona:
+contento, enamorado o muerto de risa si insistes. Mientras habláis tampoco hay textos de
+estado: mientras conecta le salen ondas de la cabeza, cuando escucha gira la cara para oírte,
+con la boca en «o», y si algo falla le sale una cruz roja encima. Solo se ven los subtítulos, en pixel art como todo lo demás.
 
-Use the `release/v6.1` branch rather than the `v6.1` release tag: an ESP32-C3 Wi-Fi initialization failure with that tag is reported in [#2344](https://github.com/78/xiaozhi-esp32/issues/2344). After switching SDK revisions, run `git submodule update --init --recursive` in the ESP-IDF directory, source its `export.sh`, and run `idf.py fullclean` in this project before rebuilding.
+### Fondos
 
-### Developer Documentation
+Detrás de Bixo hay un fondo a elegir: noche (el de siempre), blanco, prado, mazmorra,
+synthwave, navidad, verano y otoño. Casi todos se mueven un poco (copos, olas, antorchas,
+hojas…). Se cambia desde el menú, girando la rueda con el fondo a la vista, o pidiéndoselo a
+Bixo, y se queda guardado.
 
-- [Custom Board Guide](docs/custom-board.md) - Learn how to create custom boards for XiaoZhi AI
-- [MCP Protocol IoT Control Usage](docs/mcp-usage.md) - Learn how to control IoT devices via MCP protocol
-- [MCP Protocol Interaction Flow](docs/mcp-protocol.md) - Device-side MCP protocol implementation
-- [MQTT + UDP Hybrid Communication Protocol Document](docs/mqtt-udp.md)
-- [A detailed WebSocket communication protocol document](docs/websocket.md)
+### La rueda y el menú
 
-## Large Model Configuration
+| Volumen | Menú | Brillo |
+|:---:|:---:|:---:|
+| <img src="docs/img/volume.png" width="220"> | <img src="docs/img/menu.png" width="220"> | <img src="docs/img/brightness.png" width="220"> |
+| Gira la rueda: un aro verde en el borde, lleno al 100 %. | Mantén el dedo en la pantalla. Se maneja con la rueda o tocando. | Un aro amarillo mientras lo ajustas. |
 
-If you already have a XiaoZhi AI chatbot device and have connected to the official server, you can log in to the [xiaozhi.me](https://xiaozhi.me) console for configuration.
+- **Doble pulsación** de la rueda: abre una conversación o la cierra.
+- **Una pulsación:** si escucha, envía lo que has dicho; si no, empieza a escuchar. Sin
+  conexión, vuelve a buscar el wifi en ese momento.
+- **Un error** se quita solo a los pocos segundos, o antes tocando la pantalla o la rueda.
+- **Menú:** Brillo, Fondo, Nueva charla (olvida la conversación; lo que recuerda de ti se
+  queda), Wi-Fi, Reconectar wifi, Cambiar wifi, Estado, Reiniciar, Apagar y Salir.
+- **La cámara** se usa hablando: «¿qué ves?», «mira esto»… El modelo decide cuándo hacer la
+  foto.
+- **No hay palabra de activación:** la conversación se abre con la rueda.
 
-👉 [Backend Operation Video Tutorial (Old Interface)](https://www.bilibili.com/video/BV1jUCUY2EKM/)
+### Todas sus caras
 
-## Related Open Source Projects
+<div align="center"><img src="docs/img/sheet.png" width="620" alt="Expresiones de Bixo"></div>
 
-For server deployment on personal computers, refer to the following open-source projects:
+Cada expresión tiene además tres versiones grises para la batería. Las animaciones y los
+fondos van en la partición `assets`, que se genera en `server/`.
 
-- [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) Python server
-- [joey-zhou/xiaozhi-esp32-server-java](https://github.com/joey-zhou/xiaozhi-esp32-server-java) Java server
-- [AnimeAIChat/xiaozhi-server-go](https://github.com/AnimeAIChat/xiaozhi-server-go) Golang server
-- [hackers365/xiaozhi-esp32-server-golang](https://github.com/hackers365/xiaozhi-esp32-server-golang) Golang server
+## Qué cambia respecto a xiaozhi
 
-Other client projects using the XiaoZhi communication protocol:
+Todo lo propio está en [`main/boards/sensecap-watcher/`](main/boards/sensecap-watcher):
 
-- [huangjunsen0406/py-xiaozhi](https://github.com/huangjunsen0406/py-xiaozhi) Python client
-- [TOM88812/xiaozhi-android-client](https://github.com/TOM88812/xiaozhi-android-client) Android client
-- [100askTeam/xiaozhi-linux](http://github.com/100askTeam/xiaozhi-linux) Linux client by 100ask
-- [78/xiaozhi-sf32](https://github.com/78/xiaozhi-sf32) Bluetooth chip firmware by Sichuan
-- [QuecPython/solution-xiaozhiAI](https://github.com/QuecPython/solution-xiaozhiAI) QuecPython firmware by Quectel
+| Fichero | Qué hace |
+|---|---|
+| `sensecap_watcher.cc` | La placa: pantalla de mascota, táctil, rueda y menú |
+| `pet_ui.cc` / `pet_ui.h` | El aro de nivel y el menú |
+| `pet_background.cc` / `pet_background.h` | Los fondos: los pinta por celdas y solo repinta las que cambian |
+| `font_pixel_16.c` | Press Start 2P a 16 px, la fuente de todos los textos |
 
-Custom Assets Tools:
+Fuera de esa carpeta (y de `server/`) solo cambia `Application::ToggleConversation()` (abrir o
+cerrar la conversación con la rueda). Del resto se han quitado las otras placas, los idiomas que no son
+español o inglés, la documentación y las herramientas que el Watcher no usa.
 
-- [78/xiaozhi-assets-generator](https://github.com/78/xiaozhi-assets-generator) Custom Assets Generator (Wake words, fonts, emojis, backgrounds)
+## Compilar
 
-## About the Project
+`server/tools/build_firmware.sh` lo hace todo apuntando al servidor (ver
+[`server/README.md`](server/README.md)). A mano, con ESP-IDF 6.1 o su imagen de Docker:
 
-This is an open-source ESP32 project, released under the MIT license, allowing anyone to use it for free, including for commercial purposes.
+```bash
+docker run --rm --platform linux/arm64 -e OTA_URL -v "$PWD:/project" -w /project \
+  espressif/idf:release-v6.1 bash -c '. $IDF_PATH/export.sh && python3 scripts/build.py'
+```
 
-We hope this project helps everyone understand AI hardware development and apply rapidly evolving large language models to real hardware devices.
+`OTA_URL` es la dirección OTA del servidor de Bixo: el Watcher la consulta al arrancar y
+de ahí recibe la URL del WebSocket y su token. Se pasa por el entorno y solo se escribe en
+`build/`, nunca en un fichero del repositorio. Con `--language en-US` compila en inglés.
 
-If you have any ideas or suggestions, please feel free to raise Issues or join our [Discord](https://discord.gg/C759fGMBcZ) or QQ group: 1095994019
+## Grabar
 
-## Star History
+```bash
+esptool --chip esp32s3 -p PUERTO -b 230400 write-flash --flash-mode dio --flash-freq 80m \
+  --flash-size 32MB 0x200000 build/xiaozhi.bin 0xa00000 server/sprites/assets.bin
+```
 
-<a href="https://star-history.com/#78/xiaozhi-esp32&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date" />
- </picture>
-</a>
+`server/sprites/assets.bin` es la partición `assets` (sprites y fondos), que genera
+`server/sprites/pack_assets.py`.
+
+> [!WARNING]
+> No grabes una imagen completa del flash: borraría `nvsfactory` (`0x9000`), donde están
+> los datos de fábrica del Watcher.
+
+## Traer cambios de xiaozhi
+
+```bash
+git remote add upstream https://github.com/78/xiaozhi-esp32.git
+git fetch upstream
+git merge upstream/main
+```
+
+Los conflictos son siempre de dos tipos:
+
+- **Ficheros de placas o idiomas que aquí no existen:** se resuelven dejándolos borrados.
+- **Placas o idiomas nuevos** en `main/CMakeLists.txt` y `main/Kconfig.projbuild`: se
+  descartan esas líneas.
+
+## Licencia
+
+MIT, como xiaozhi-esp32 ([`LICENSE`](LICENSE)). La fuente Press Start 2P es de The Press
+Start 2P Project Authors, con licencia SIL Open Font License
+([`PressStart2P-OFL.txt`](main/boards/sensecap-watcher/PressStart2P-OFL.txt)). Las capturas
+de la pantalla son simulaciones generadas con los mismos sprites, colores y fuente que el
+firmware.

@@ -20,6 +20,7 @@ dependencies:
     rules:
     - if: target in [esp32, esp32s2, esp32s3, esp32p4]
   espressif/esp_lcd_spd2010: ^2.0.0~1
+  espressif/esp_lcd_touch_spd2010: ^2.1.0
   espressif/esp_io_expander_tca9554: ~2.0.3
   waveshare/custom_io_expander_ch32v003: ^2.0.0
   espressif/esp_lcd_panel_io_additions: ^1.0.1~1

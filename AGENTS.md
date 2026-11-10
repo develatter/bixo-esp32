@@ -1,93 +1,63 @@
 # AGENTS.md
 
-## Project
+Bixo, an AI virtual pet on a SenseCAP Watcher. Read `README.md` (the device) and
+`server/README.md` (the brain) first.
 
-XiaoZhi is an ESP-IDF C/C++ voice-assistant firmware supporting many chips, boards, displays, audio devices, and network transports. A build selects exactly one board implementation.
+- Repository root: the firmware, a fork of xiaozhi-esp32 trimmed to this board (ESP-IDF 6.1,
+  LVGL 9). Our code is in `main/boards/sensecap-watcher/`; outside it only
+  `Application::ToggleConversation()` changes. Keep it that way so upstream merges stay easy.
+- `server/`: the voice server (Python, uv), the Hermes Agent profile, and the sprites and
+  backgrounds packed into the `assets` partition.
 
-Use the ESP-IDF `release/v6.1` branch when possible. The minimum supported SDK is ESP-IDF v6.0.1. IDF 5.x is not supported.
+## Conventions
 
-## Architecture
+- Code, comments, docs for developers and commit messages in English; everything the user reads
+  or hears (screen, menu, voice, tool descriptions for Hermes, READMEs) in Spanish (Spain).
+- Comments say what the code does or why, never how it came to be.
+- Python: type hints, one module per concern under `server/pet/`. C++: the board's style
+  (4 spaces, `snake_case_` members, `kConstants`).
+- Faces are sprites, never status text: a new device state gets an animation in
+  `server/sprites/bixo.py` (`ANIMATIONS`) and a mapping in `CustomLcdDisplay::ShowEmotion()`.
+  Every animation also comes in grey battery tiers (`_g1`..`_g3`), generated automatically.
+- Sprites are a 22x20 logical canvas; glyphs off the body get a dark outline so they read on
+  every background. Backgrounds share a 13 px cell grid with the sprite (`backgrounds.py`);
+  the firmware paints them by cells (`pet_background.cc`). Bixo's shadow is a separate layer,
+  only drawn under his sprite.
+- The menu (`pet_ui.cc`) is driven from the main task (`Application::Schedule`), by the wheel
+  and the touch screen.
+- Hermes tools live in `server/pet/tools.py`; device actions they need are MCP tools on the
+  Watcher (`self.*`), registered in `SensecapWatcher::InitializeTools()`.
 
-- `main/application.*`: main event loop, protocol lifecycle, and high-level behavior.
-- `main/device_state_machine.*`: legal runtime state transitions.
-- `main/boards/common/`: board interfaces and reusable hardware/network helpers.
-- `main/boards/**/`: board-specific pins, initialization, and build variants.
-- `main/audio/`: codecs, audio tasks, engines, wake words, and queues.
-- `main/protocols/`: transport-neutral API plus WebSocket and MQTT/UDP.
-- `main/display/` and `main/led/`: reusable UI implementations.
-- `main/mcp_server.*`: common device-side MCP tools and dispatch.
-- `main/Kconfig.projbuild`: board and feature configuration.
-- `main/CMakeLists.txt`: source, board, locale, font, and asset selection.
-- `scripts/build.py`: canonical board/variant build entry point.
+## Secrets
 
-Read the closest existing implementation before adding a new one. Prefer the narrowest owning layer; do not put board-specific behavior into core modules.
-
-## Required Rules
-
-- Preserve unrelated worktree changes and keep patches focused.
-- A build must export exactly one board factory through `DECLARE_BOARD(...)`.
-- Never alter an existing board's pins to support different hardware. Add a uniquely named board or release variant; board identity affects OTA compatibility.
-- Core code depends on `Board` interfaces, never a concrete board class or board `config.h`.
-- Treat camera, backlight, display, LED, battery, and similar capabilities as optional.
-- Change runtime state through `Application::SetDeviceState()` and the state machine.
-- Callbacks may run outside the main task. Schedule application mutations with `Application::Schedule()` or event bits.
-- Do not block the main event loop or audio tasks. Avoid unbounded queues and repeated large allocations in audio paths.
-- Keep shared message semantics in `Protocol`; verify both transports when changing its contract.
-- Validate network input and preserve `cJSON` ownership. NVS keys are persistent API and require migration when changed.
-- Guard target-specific features with Kconfig/component rules. Do not assume every target has PSRAM or S3/P4 resources.
-- Do not manually edit generated/vendor output: `build/`, `releases/`, `managed_components/`, `components/`, `sdkconfig*`, `main/assets/lang_config.h`, or generated mmap headers.
-- Format only touched C/C++ files with the repository `.clang-format`; avoid unrelated mass formatting.
-
-## Boards and Configuration
-
-Board selection is a coupled chain:
-
-`config.json` -> `scripts/build.py` -> `main/Kconfig.projbuild` -> `main/CMakeLists.txt` -> board source and `config.h`.
-
-When adding a board or variant, update every relevant link in that chain. Include a unique board identity, correct chip target, flash/partition settings, exactly one `DECLARE_BOARD`, and board documentation. Follow `docs/custom-board.md`.
+- Never write a secret to a tracked file, a log you keep, or a commit. The OTA URL carries the
+  server secret: it only exists in the environment and in `build/` (never print `build/sdkconfig`
+  or the build log unredacted).
+- Settings go in `server/.env` (ignored; see `server/.env.example`) or the environment. Don't
+  create or read `server/.env` yourself: ask the user to run a real build or start the server.
+- Serial logs include tokens and URLs: filter and redact them in memory, don't save them raw.
+- No real hostnames, IPs or MACs in the repository.
 
 ## Commands
 
-Source the intended ESP-IDF environment first:
+From `server/`:
 
-```sh
-source /path/to/esp-idf/export.sh
-idf.py --version
+```bash
+uv run python sprites/bixo.py                              # sprites -> sprites/out
+uv run python sprites/backgrounds.py [--mockups]           # background previews
+uv run python sprites/pack_assets.py ../build/generated_assets.bin   # -> sprites/assets.bin
+tools/build_firmware.sh --check                            # compile check, no secrets needed
+tools/build_firmware.sh                                    # real build (needs the secret)
+tools/run_server.sh                                        # the server (needs the secret)
 ```
 
-```sh
-# Discover exact board and variant names
-python3 scripts/build.py --list-boards
+Run `tools/build_firmware.sh --check` after every firmware change, and regenerate the assets
+after touching sprites or backgrounds.
 
-# Canonical variant build
-python3 scripts/build.py <board-directory> --name <variant-name>
+Flash only the app and the assets, never a merged image (it would wipe `nvsfactory` at
+`0x9000`, the Watcher's factory data):
 
-# Host-side build tests
-python3 -m unittest discover -s scripts/tests -v
-
-# Format/check touched files
-clang-format -i <files>
-clang-format --dry-run -Werror <files>
+```bash
+esptool --chip esp32s3 -p PORT -b 230400 write-flash --flash-mode dio --flash-freq 80m \
+  --flash-size 32MB 0x200000 build/xiaozhi.bin 0xa00000 server/sprites/assets.bin
 ```
-
-The build script changes local `sdkconfig` and build state. Do not assume the build directory still represents a previous target.
-
-## Validation
-
-- Board-only change: build affected variants and smoke-test changed hardware.
-- Core, common-board, audio, protocol, display, dependency, Kconfig, or CMake change: run host tests and build representative affected chip/network paths.
-- Protocol changes: verify WebSocket and MQTT/UDP when shared behavior changes.
-- Audio changes: verify capture, playback, wake/VAD, interruption, reconnect, and applicable AEC modes.
-- UI/assets changes: verify applicable no-display/OLED/LVGL paths and partition size.
-- Always report what was tested and what still needs physical hardware. A successful build is not hardware validation.
-
-## Authoritative Documentation
-
-- Overview and SDK policy: `README.md`
-- Board guide: `docs/custom-board.md`
-- Audio design: `main/audio/README.md`
-- Code style: `docs/code_style.md`
-- Protocols: `docs/websocket.md`, `docs/mqtt-udp.md`, `docs/mcp-protocol.md`
-- CI matrix: `.github/workflows/build.yml`
-
-Keep detailed or fast-changing information in those files, not here. Add a nested `AGENTS.md` only when a subsystem needs specialized instructions.

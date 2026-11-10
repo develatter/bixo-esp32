@@ -802,6 +802,19 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
+void Application::ToggleConversation() {
+    Schedule([this]() {
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            if (GetDeviceState() == kDeviceStateSpeaking) {
+                AbortSpeaking(kAbortReasonNone);
+            }
+            protocol_->CloseAudioChannel();
+        } else if (GetDeviceState() == kDeviceStateIdle) {
+            StartListening();
+        }
+    });
+}
+
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
 

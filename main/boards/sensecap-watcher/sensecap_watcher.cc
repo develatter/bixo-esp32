@@ -10,12 +10,19 @@
 #include "power_save_timer.h"
 #include "sscma_camera.h"
 #include "lvgl_theme.h"
+#include "wifi_manager.h"
+#include "pet_ui.h"
+#include "pet_background.h"
+#include "mcp_server.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <esp_check.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_spd2010.h>
+#include <esp_lcd_touch_spd2010.h>
+#include <esp_timer.h>
 #include <esp_adc/adc_oneshot.h>
 #include <driver/spi_master.h>
 #include <driver/i2c_master.h>
@@ -28,14 +35,23 @@
 #include <esp_mac.h>
 #include <nvs_flash.h>
 #include <esp_app_desc.h>
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <mutex>
+#include <string>
 
 #include "assets/lang_config.h"
 
 #define TAG "sensecap_watcher"
 
+// Bixo's screen: only the pet, centred. No clock or status icons: the body colour fades to
+// grey below half battery (the <emotion>_g1.._g3 sprites), an almost flat battery shows the
+// "exhausted" face and a lost connection the "no_wifi" one. The state shows on his face too;
+// only notifications and subtitles are text.
 class CustomLcdDisplay : public SpiLcdDisplay {
     public:
-        CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle, 
+        CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
                         esp_lcd_panel_handle_t panel_handle,
                         int width,
                         int height,
@@ -43,7 +59,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                         int offset_y,
                         bool mirror_x,
                         bool mirror_y,
-                        bool swap_xy) 
+                        bool swap_xy)
             : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
             // Note: UI customization should be done in SetupUI(), not in constructor
             // to ensure lvgl objects are created before accessing them
@@ -56,12 +72,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             DisplayLockGuard lock(this);
             auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
             auto text_font = lvgl_theme->text_font()->font();
-            auto icon_font = lvgl_theme->icon_font()->font();
 
-            lv_obj_set_size(top_bar_, LV_HOR_RES, text_font->line_height);
-            lv_obj_set_style_layout(top_bar_, LV_LAYOUT_NONE, 0);
-            lv_obj_set_style_pad_top(top_bar_, 10, 0);
-            lv_obj_set_style_pad_bottom(top_bar_, 1, 0);
+            lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
 
             lv_obj_set_size(status_bar_, LV_HOR_RES, text_font->line_height);
             lv_obj_set_style_layout(status_bar_, LV_LAYOUT_NONE, 0);
@@ -70,18 +83,6 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             lv_obj_set_y(status_bar_, text_font->line_height);
             lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_IGNORE_LAYOUT);
 
-            // Reparent mute and battery labels to top_bar_ to allow absolute positioning
-            lv_obj_set_parent(mute_label_, top_bar_);
-            lv_obj_set_parent(battery_label_, top_bar_);
-            lv_obj_set_style_margin_left(battery_label_, 0, 0);
-
-            // 针对圆形屏幕调整位置
-            //      network  mute  battery     //
-            //               status            //
-            lv_obj_align(network_label_, LV_ALIGN_TOP_MID, -1.5 * icon_font->line_height, 0);
-            lv_obj_align(mute_label_, LV_ALIGN_TOP_MID, 1.0 * icon_font->line_height, 0);
-            lv_obj_align(battery_label_, LV_ALIGN_TOP_MID, 2.5 * icon_font->line_height, 0);
-            
             lv_obj_align(status_label_, LV_ALIGN_BOTTOM_MID, 0, 0);
             lv_obj_set_flex_grow(status_label_, 0);
             lv_obj_set_width(status_label_, LV_HOR_RES * 0.75);
@@ -91,22 +92,276 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
             lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
 
-            lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -20);
-            lv_obj_set_style_bg_color(low_battery_popup_, lv_color_hex(0xFF0000), 0);
-            lv_obj_set_width(low_battery_label_, LV_HOR_RES * 0.75);
-            lv_label_set_long_mode(low_battery_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            // The sprites draw the body below the middle of the canvas (it sits on the ground).
+            lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -kBodyOffset);
 
-            // 针对圆形屏幕调整底部对话框位置，避免被圆角遮挡
+            // Move the bottom dialog for the round screen so the rounded corners don't clip it
             lv_obj_set_style_pad_bottom(bottom_bar_, 30, 0);
-            lv_obj_set_width(chat_message_label_, LV_HOR_RES * 0.75); // 限制宽度，避免文字贴边
+            lv_obj_set_width(chat_message_label_, LV_HOR_RES * 0.75); // limit the width so text doesn't touch the edge
+            lv_obj_set_style_text_line_space(chat_message_label_, 6, 0);
+            UsePixelFont();
+            LoadBackground();
+        }
+
+        // The assets bring their own theme font: put the pixel font back on top of it, and the
+        // background and its text colours over the theme's.
+        virtual void SetTheme(Theme* theme) override {
+            SpiLcdDisplay::SetTheme(theme);
+            DisplayLockGuard lock(this);
+            UsePixelFont();
+            LoadBackground();
+        }
+
+        virtual void SetPowerSaveMode(bool on) override {
+            SpiLcdDisplay::SetPowerSaveMode(on);
+            DisplayLockGuard lock(this);
+            background_.SetPaused(on);
+        }
+
+        // Hides Bixo and his subtitles, to see a background on its own.
+        void SetPetHidden(bool hidden) {
+            DisplayLockGuard lock(this);
+            pet_hidden_ = hidden;
+            UpdateShadow();
+            bool subtitle = lv_label_get_text(chat_message_label_)[0] != '\0';
+            for (lv_obj_t* obj : {emoji_box_, bottom_bar_, status_bar_}) {
+                bool show = !hidden && (obj != bottom_bar_ || subtitle);  // an empty bar stays hidden
+                show ? lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN) : lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+
+        std::vector<std::string> BackgroundLabels() {
+            DisplayLockGuard lock(this);
+            std::vector<std::string> labels;
+            for (const auto& info : background_.list()) {
+                labels.push_back(info.label);
+            }
+            return labels;
+        }
+
+        int BackgroundIndex() {
+            DisplayLockGuard lock(this);
+            return background_.current();
+        }
+
+        // Shows a background and remembers it.
+        bool SetBackground(int index) {
+            DisplayLockGuard lock(this);
+            if (!ShowBackground(index)) {
+                return false;
+            }
+            Settings settings("pet", true);
+            settings.SetString("background", background_.list()[index].name);
+            return true;
+        }
+
+        bool SetBackground(const std::string& name) {
+            DisplayLockGuard lock(this);
+            return SetBackground(background_.Find(name));
+        }
+
+        // Idle, connecting, listening, speaking and errors show no status text: Bixo's face says it.
+        virtual void SetStatus(const char* status) override {
+            bool error = strcmp(status, Lang::Strings::ERROR) == 0;
+            bool silent = error || strcmp(status, Lang::Strings::STANDBY) == 0 ||
+                          strcmp(status, Lang::Strings::CONNECTING) == 0 ||
+                          strcmp(status, Lang::Strings::LISTENING) == 0 ||
+                          strcmp(status, Lang::Strings::SPEAKING) == 0;
+            connecting_ = strcmp(status, Lang::Strings::CONNECTING) == 0;
+            listening_ = strcmp(status, Lang::Strings::LISTENING) == 0;
+            error_ = error;
+            if (error) {
+                StartErrorTimer();
+            }
+            SpiLcdDisplay::SetStatus(silent ? "" : status);
+        }
+
+        bool ShowingError() const { return error_; }
+
+        // Clears an error face and its message, also outside idle (where the app keeps them).
+        void DismissError() {
+            if (!error_) {
+                return;
+            }
+            Application::GetInstance().DismissAlert();
+            if (error_) {
+                SetStatus(Lang::Strings::STANDBY);
+                SetChatMessage("system", "");
+                SetEmotion("neutral");
+            }
+        }
+
+        virtual bool SetEmotion(const char* emotion) override {
+            {
+                std::lock_guard<std::mutex> lock(emotion_mutex_);
+                requested_emotion_ = emotion;
+            }
+            return ShowEmotion();
+        }
+
+        // Called every second: battery and Wi-Fi show on Bixo himself, not as icons.
+        virtual void UpdateStatusBar(bool update_all = false) override {
+            auto& board = Board::GetInstance();
+            int level;
+            bool charging, discharging;
+            int tier = battery_tier_;
+            bool exhausted = exhausted_;
+            esp_pm_lock_acquire(pm_lock_);
+            bool have_level = board.GetBatteryLevel(level, charging, discharging);
+            esp_pm_lock_release(pm_lock_);
+            if (have_level) {
+                tier = BatteryTier(level);
+                if (tier < battery_tier_ && BatteryTier(level - kHysteresis) != tier) {
+                    tier = battery_tier_;  // not clearly above the boundary yet
+                }
+                exhausted = discharging && level <= (exhausted_ ? kExhaustedLevel + kHysteresis : kExhaustedLevel);
+            }
+            auto& wifi = WifiManager::GetInstance();
+            bool offline = !wifi.IsConnected() || wifi.IsConfigMode();
+
+            if (update_all || tier != battery_tier_ || exhausted != exhausted_ || offline != offline_) {
+                if (tier != battery_tier_ || exhausted != exhausted_ || offline != offline_) {
+                    ESP_LOGI(TAG, "Look: battery tier %d, exhausted %d, offline %d", tier, exhausted, offline);
+                }
+                battery_tier_ = tier;
+                exhausted_ = exhausted;
+                offline_ = offline;
+                ShowEmotion();
+            }
+        }
+
+    private:
+        // Every text on screen inherits it from the screen object.
+        void UsePixelFont() {
+            lv_obj_set_style_text_font(lv_screen_active(), PixelFont(this), 0);
+        }
+
+        PetBackground background_;
+
+        // The saved background, or the first one.
+        void LoadBackground() {
+            if (container_ == nullptr) {
+                return;
+            }
+            background_.Load(container_);
+            Settings settings("pet");
+            int index = background_.Find(settings.GetString("background"));
+            ShowBackground(index >= 0 ? index : 0);
+            UpdateShadow();
+        }
+
+        bool ShowBackground(int index) {
+            if (!background_.Show(index)) {
+                return false;
+            }
+            const auto& info = background_.list()[index];
+            lv_obj_set_style_bg_color(bottom_bar_, info.panel, 0);
+            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_60, 0);
+            lv_obj_set_style_text_color(chat_message_label_, info.text, 0);
+            lv_obj_set_style_text_color(status_label_, info.text, 0);
+            lv_obj_set_style_text_color(notification_label_, info.text, 0);
+            return true;
+        }
+
+        static constexpr int kBodyOffset = 39;      // px from the canvas centre to the body's
+        static constexpr int kExhaustedLevel = 10;  // % (discharging) for the exhausted face
+        static constexpr int kHysteresis = 3;       // % to climb back past a boundary
+        static constexpr const char* kTierSuffix[] = {"", "_g1", "_g2", "_g3"};
+
+        std::mutex emotion_mutex_;
+        std::string requested_emotion_ = "neutral";
+        std::string shown_emotion_;  // only for the log
+        bool sprite_shown_ = false;
+        bool pet_hidden_ = false;
+        int battery_tier_ = 0;
+        bool exhausted_ = false;
+        bool offline_ = false;
+
+        static constexpr int64_t kErrorShownUs = 8 * 1000 * 1000;
+        std::atomic<bool> connecting_{false};
+        std::atomic<bool> listening_{false};
+        std::atomic<bool> error_{false};
+        esp_timer_handle_t error_timer_ = nullptr;
+
+        void StartErrorTimer() {
+            if (error_timer_ == nullptr) {
+                esp_timer_create_args_t args = {
+                    .callback = [](void* arg) {
+                        auto self = static_cast<CustomLcdDisplay*>(arg);
+                        Application::GetInstance().Schedule([self]() { self->DismissError(); });
+                    },
+                    .arg = this,
+                    .dispatch_method = ESP_TIMER_TASK,
+                    .name = "error_face",
+                    .skip_unhandled_events = true,
+                };
+                ESP_ERROR_CHECK(esp_timer_create(&args, &error_timer_));
+            }
+            esp_timer_stop(error_timer_);
+            esp_timer_start_once(error_timer_, kErrorShownUs);
+        }
+
+        static int BatteryTier(int level) {
+            return level >= 50 ? 0 : level >= 35 ? 1 : level >= 20 ? 2 : 3;
+        }
+
+        bool ShowEmotion() {
+            std::string emotion;
+            {
+                std::lock_guard<std::mutex> lock(emotion_mutex_);
+                emotion = requested_emotion_;
+            }
+            if (offline_ && Application::GetInstance().GetDeviceState() != kDeviceStateStarting) {
+                emotion = "no_wifi";
+            } else if (error_) {
+                emotion = "error";
+            } else if (connecting_ && emotion == "neutral") {
+                emotion = "connecting";
+            } else if (listening_ && emotion == "neutral") {
+                emotion = "listening";
+            } else if (exhausted_ && (emotion == "neutral" || emotion == "sleepy")) {
+                // Only the resting faces: a tap or a reply still shows, just very grey.
+                emotion = "exhausted";
+            }
+            if (emotion != shown_emotion_) {
+                ESP_LOGI(TAG, "Face: %s", emotion.c_str());
+                shown_emotion_ = emotion;
+            }
+            // System icons (link, download...) have no grey sprites: they show as they are.
+            std::string tinted = emotion + kTierSuffix[battery_tier_];
+            bool shown = (battery_tier_ > 0 && SpiLcdDisplay::SetEmotion(tinted.c_str())) ||
+                         SpiLcdDisplay::SetEmotion(emotion.c_str());
+            DisplayLockGuard lock(this);
+            sprite_shown_ = shown && !lv_obj_has_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+            UpdateShadow();
+            return shown;
+        }
+
+        // The shadow belongs to Bixo's sprite: not under a system icon (while starting up, say),
+        // nor while he is hidden. Call with the display locked.
+        void UpdateShadow() {
+            background_.SetShadow(sprite_shown_ && !pet_hidden_);
         }
 };
 
 class SensecapWatcher : public WifiBoard {
 private:
+    static constexpr uint32_t kVolumeColor = 0x3DDC84;
+    static constexpr int kVolumeStep = 5;
+    static constexpr int64_t kKnobReverseUs = 120 * 1000;
+    static constexpr int64_t kLongPressUs = 700 * 1000;
+    // Sent as if it were a wake word; the server starts a new conversation with Hermes.
+    static constexpr const char* kNewChatCommand = "<nueva charla>";
+
     i2c_master_bus_handle_t i2c_bus_;
-    LcdDisplay* display_;
+    CustomLcdDisplay* display_;
     std::unique_ptr<Knob> knob_;
+    int knob_direction_ = 0;
+    bool knob_reverse_pending_ = false;
+    int64_t knob_last_us_ = 0;
+    std::atomic<int> knob_steps_{0};
+    std::atomic<bool> knob_scheduled_{false};
+    std::atomic<bool> wifi_reconnecting_{false};
     esp_io_expander_handle_t io_exp_handle;
     button_handle_t btns;
     PowerSaveTimer* power_save_timer_;
@@ -116,6 +371,13 @@ private:
     button_driver_t* btn_driver_ = nullptr;
     static SensecapWatcher* instance_;
     SscmaCamera* camera_ = nullptr;
+    i2c_master_bus_handle_t touch_i2c_bus_ = nullptr;
+    esp_lcd_touch_handle_t touch_ = nullptr;
+    esp_timer_handle_t touch_reaction_timer_ = nullptr;
+    int64_t last_tap_us_ = 0;
+    int tap_streak_ = 0;
+    std::unique_ptr<LevelRing> ring_;
+    std::unique_ptr<PetMenu> menu_;
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
@@ -219,30 +481,44 @@ private:
         assert(ret == ESP_OK);
     }
 
+    // Runs in the knob's polling timer, which decodes the encoder in software: keep it short
+    // or steps get lost and read backwards. Steps are added up and applied in the main task.
     void OnKnobRotate(bool clockwise) {
-        auto codec = GetAudioCodec();
-        int current_volume = codec->output_volume();
-        int new_volume = current_volume + (clockwise ? -5 : 5); 
-
-        // 确保音量在有效范围内
-        if (new_volume > 100) {
-            new_volume = 100;
-            ESP_LOGW(TAG, "Volume reached maximum limit: %d", new_volume);
-        } else if (new_volume < 0) {
-            new_volume = 0;
-            ESP_LOGW(TAG, "Volume reached minimum limit: %d", new_volume);
+        int step = clockwise ? -1 : 1;  // +1 turns the volume up and moves up the menu
+        int64_t now = esp_timer_get_time();
+        // A lone step against the way the wheel is turning is a decoding glitch; two in a row
+        // are the wheel really turning back.
+        bool reversing = step != knob_direction_ && now - knob_last_us_ < kKnobReverseUs;
+        knob_last_us_ = now;
+        if (reversing && !knob_reverse_pending_) {
+            knob_reverse_pending_ = true;
+            return;
         }
-
-        codec->SetOutputVolume(new_volume);
-        ESP_LOGI(TAG, "Volume changed from %d to %d", current_volume, new_volume);
-        
-        // 显示通知前检查实际变化
-        if (new_volume != codec->output_volume()) {
-            ESP_LOGE(TAG, "Failed to set volume! Expected:%d Actual:%d", 
-                   new_volume, codec->output_volume());
+        knob_reverse_pending_ = false;
+        knob_direction_ = step;
+        knob_steps_ += step;
+        if (!knob_scheduled_.exchange(true)) {
+            Application::GetInstance().Schedule([this]() { ApplyKnobSteps(); });
         }
-        GetDisplay()->ShowNotification(std::string(Lang::Strings::VOLUME) + ": "+std::to_string(codec->output_volume()));
+    }
+
+    void ApplyKnobSteps() {
+        knob_scheduled_ = false;
+        int steps = knob_steps_.exchange(0);
+        if (steps == 0) {
+            return;
+        }
         power_save_timer_->WakeUp();
+        if (MenuOpen()) {
+            menu_->Move(steps);
+            return;
+        }
+        auto codec = GetAudioCodec();
+        int volume = std::clamp(codec->output_volume() + steps * kVolumeStep, 0, 100);
+        codec->SetOutputVolume(volume);
+        if (ring_) {
+            ring_->Show(codec->output_volume(), kVolumeColor);
+        }
     }
 
     void InitializeKnob() {
@@ -255,10 +531,10 @@ private:
     }
 
     void InitializeButton() {
-        // 设置静态实例指针
+        // Set the static instance pointer
         instance_ = this;
         
-        // watcher 是通过长按滚轮进行开机的, 需要等待滚轮释放, 否则用户开机松手时可能会误触成单击
+        // The watcher powers on by long-pressing the wheel; wait for the wheel to be released, otherwise letting go after power-on may be misread as a click
         ESP_LOGI(TAG, "waiting for knob button release");
         while(IoExpanderGetLevel(BSP_KNOB_BTN) == 0) {
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -279,13 +555,53 @@ private:
         iot_button_register_cb(btns, BUTTON_SINGLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<SensecapWatcher*>(usr_data);
             self->power_save_timer_->WakeUp();
+            if (self->MenuOpen()) {
+                Application::GetInstance().Schedule([self]() { self->menu_->Select(); });
+                return;
+            }
+
+            if (self->display_->ShowingError()) {
+                Application::GetInstance().Schedule([self]() { self->display_->DismissError(); });
+                return;
+            }
 
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting) {
+            auto state = app.GetDeviceState();
+            if (state == kDeviceStateStarting) {
                 self->EnterWifiConfigMode();
                 return;
             }
-            app.ToggleChatState();
+            if (self->Offline()) {
+                self->ReconnectWifi();
+                return;
+            }
+            // Push to talk: one click starts listening (interrupting a reply), the next one sends.
+            if (state == kDeviceStateListening) {
+                app.StopListening();
+            } else if (state == kDeviceStateIdle || state == kDeviceStateSpeaking) {
+                app.StartListening();
+            } else {
+                app.ToggleChatState();
+            }
+        }, this);
+
+        // Double click opens a conversation (listening) or hangs up the current one.
+        iot_button_register_cb(btns, BUTTON_DOUBLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
+            auto self = static_cast<SensecapWatcher*>(usr_data);
+            self->power_save_timer_->WakeUp();
+            if (self->MenuOpen()) {
+                Application::GetInstance().Schedule([self]() { self->menu_->Close(); });
+                return;
+            }
+            if (self->display_->ShowingError()) {
+                Application::GetInstance().Schedule([self]() { self->display_->DismissError(); });
+                return;
+            }
+            if (self->Offline() && Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                self->ReconnectWifi();
+                return;
+            }
+            Application::GetInstance().ToggleConversation();
         }, this);
         
         iot_button_register_cb(btns, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
@@ -302,8 +618,8 @@ private:
 
         iot_button_register_cb(btns, BUTTON_LONG_PRESS_HOLD, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<SensecapWatcher*>(usr_data);
-            self->long_press_cnt_++; // 每隔20ms加一
-            // 长按10s 恢复出厂设置: 2+0.02*400 = 10
+            self->long_press_cnt_++; // incremented every 20ms
+            // Long press for 10s to factory reset: 2+0.02*400 = 10
             if (self->long_press_cnt_ > 400) {
                 ESP_LOGI(TAG, "Factory reset");
                 nvs_flash_erase();
@@ -376,7 +692,7 @@ private:
         display_ = new CustomLcdDisplay(panel_io_, panel_,
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
         
-        // 使每次刷新的起始列数索引是4的倍数且列数总数是4的倍数，以满足SPD2010的要求
+        // Make the start column index of each refresh a multiple of 4, and the total column count a multiple of 4, as the SPD2010 requires
         lv_display_add_event_cb(lv_display_get_default(), [](lv_event_t *e) {
             lv_area_t *area = (lv_area_t *)lv_event_get_param(e);
             uint16_t x1 = area->x1;
@@ -592,6 +908,246 @@ private:
         camera_ = new SscmaCamera(io_exp_handle);
     }
 
+
+    // The SPD2010 panel has its own touch controller on a second I2C bus. It is polled
+    // (its interrupt line sits behind the IO expander) and only drives Bixo's reactions.
+    void InitializeTouch() {
+        i2c_master_bus_config_t bus_cfg = {
+            .i2c_port = (i2c_port_t)BSP_TOUCH_I2C_NUM,
+            .sda_io_num = BSP_TOUCH_I2C_SDA,
+            .scl_io_num = BSP_TOUCH_I2C_SCL,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .intr_priority = 0,
+            .trans_queue_depth = 0,
+            .flags = {
+                .enable_internal_pullup = 1,
+            },
+        };
+        if (i2c_new_master_bus(&bus_cfg, &touch_i2c_bus_) != ESP_OK) {
+            ESP_LOGE(TAG, "Touch I2C bus init failed");
+            return;
+        }
+        esp_lcd_panel_io_handle_t io = nullptr;
+        // Same values as ESP_LCD_TOUCH_IO_I2C_SPD2010_CONFIG(), whose designators are out of
+        // declaration order for C++.
+        esp_lcd_panel_io_i2c_config_t io_cfg = {};
+        io_cfg.dev_addr = ESP_LCD_TOUCH_IO_I2C_SPD2010_ADDRESS;
+        io_cfg.control_phase_bytes = 1;
+        io_cfg.flags.disable_control_phase = 1;
+        io_cfg.scl_speed_hz = 100000;
+        if (esp_lcd_new_panel_io_i2c(touch_i2c_bus_, &io_cfg, &io) != ESP_OK) {
+            ESP_LOGE(TAG, "Touch panel IO init failed");
+            return;
+        }
+        esp_lcd_touch_config_t tp_cfg = {
+            .x_max = DISPLAY_WIDTH,
+            .y_max = DISPLAY_HEIGHT,
+            .rst_gpio_num = GPIO_NUM_NC,  // shared with the LCD reset
+            .int_gpio_num = GPIO_NUM_NC,
+            .levels = {
+                .reset = 0,
+                .interrupt = 0,
+            },
+            .flags = {
+                .swap_xy = DISPLAY_SWAP_XY,
+                .mirror_x = DISPLAY_MIRROR_X,
+                .mirror_y = DISPLAY_MIRROR_Y,
+            },
+        };
+        if (esp_lcd_touch_new_i2c_spd2010(io, &tp_cfg, &touch_) != ESP_OK) {
+            ESP_LOGE(TAG, "Touch controller init failed");
+            touch_ = nullptr;
+            return;
+        }
+
+        esp_timer_create_args_t timer_args = {
+            .callback = [](void* arg) {
+                Application::GetInstance().Schedule([]() {
+                    if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                        Board::GetInstance().GetDisplay()->SetEmotion("neutral");
+                    }
+                });
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "touch_reaction",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &touch_reaction_timer_));
+
+        // A short touch is a tap (on release); holding it opens the menu.
+        xTaskCreate([](void* arg) {
+            auto self = static_cast<SensecapWatcher*>(arg);
+            int64_t pressed_since = 0;  // 0 = not touching
+            bool held = false;
+            esp_lcd_touch_point_data_t point = {};
+            while (true) {
+                esp_lcd_touch_point_data_t now_point;
+                uint8_t count = 0;
+                if (esp_lcd_touch_read_data(self->touch_) == ESP_OK) {
+                    esp_lcd_touch_get_data(self->touch_, &now_point, &count, 1);
+                }
+                int64_t now = esp_timer_get_time();
+                if (count > 0) {
+                    if (pressed_since == 0) {
+                        pressed_since = now;
+                        held = false;
+                    }
+                    point = now_point;
+                    if (!held && now - pressed_since >= kLongPressUs) {
+                        held = true;
+                        self->OnLongPress();
+                    }
+                } else if (pressed_since != 0) {
+                    if (!held) {
+                        self->OnTap(point.x, point.y);
+                    }
+                    pressed_since = 0;
+                }
+                vTaskDelay(pdMS_TO_TICKS(40));
+            }
+        }, "touch", 3072, this, 2, nullptr);
+        ESP_LOGI(TAG, "Touch initialized");
+    }
+
+    // A tap pets Bixo while it's idle: happy, then loving, then giggling if you keep at it.
+    void OnTap(uint16_t x, uint16_t y) {
+        if (MenuOpen()) {
+            power_save_timer_->WakeUp();
+            Application::GetInstance().Schedule([this, y]() { menu_->Tap(y); });
+            return;
+        }
+        if (display_->ShowingError()) {
+            power_save_timer_->WakeUp();
+            Application::GetInstance().Schedule([this]() { display_->DismissError(); });
+            return;
+        }
+        int64_t now = esp_timer_get_time();
+        tap_streak_ = (now - last_tap_us_ < 1500 * 1000) ? tap_streak_ + 1 : 0;
+        last_tap_us_ = now;
+        ESP_LOGI(TAG, "Tap at %u,%u (streak %d)", x, y, tap_streak_);
+        power_save_timer_->WakeUp();
+        static const char* const kReactions[] = {"happy", "loving", "laughing"};
+        const char* emotion = kReactions[tap_streak_ < 2 ? tap_streak_ : 2];
+        Application::GetInstance().Schedule([this, emotion]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() != kDeviceStateIdle) {
+                return;
+            }
+            GetDisplay()->SetEmotion(emotion);
+            if (tap_streak_ == 0) {
+                app.PlaySound(Lang::Sounds::OGG_POPUP);
+            }
+            esp_timer_stop(touch_reaction_timer_);
+            esp_timer_start_once(touch_reaction_timer_, 2500 * 1000);
+        });
+    }
+
+    // Knob and button work before the menu exists (they are set up first).
+    bool MenuOpen() const { return menu_ && menu_->IsOpen(); }
+
+    void OnLongPress() {
+        ESP_LOGI(TAG, "Long press");
+        power_save_timer_->WakeUp();
+        Application::GetInstance().Schedule([this]() {
+            if (!menu_->IsOpen()) {
+                // The timer that would end a tap reaction is stopped: end it now.
+                esp_timer_stop(touch_reaction_timer_);
+                if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                    display_->SetEmotion("neutral");
+                }
+                menu_->Open();
+            }
+        });
+    }
+
+    bool Offline() const {
+        auto& wifi = WifiManager::GetInstance();
+        return !wifi.IsConnected() && !wifi.IsConfigMode();
+    }
+
+    // Starts a fresh scan now instead of waiting for the next retry.
+    void ReconnectWifi() {
+        if (WifiManager::GetInstance().IsConfigMode() || wifi_reconnecting_.exchange(true)) {
+            return;
+        }
+        ESP_LOGI(TAG, "Reconnecting Wi-Fi");
+        xTaskCreate([](void* arg) {
+            auto self = static_cast<SensecapWatcher*>(arg);
+            auto& wifi = WifiManager::GetInstance();
+            wifi.StopStation();
+            wifi.StartStation();
+            self->wifi_reconnecting_ = false;
+            vTaskDelete(nullptr);
+        }, "wifi_reconnect", 4096, this, 2, nullptr);
+    }
+
+    void PowerOff() {
+        ESP_LOGI(TAG, "Power off from the menu");
+        IoExpanderSetLevel(BSP_PWR_LCD, 0);
+        IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);  // with the charger plugged in it stays on
+    }
+
+    std::string NetworkInfo() {
+        auto& wifi = WifiManager::GetInstance();
+        if (!wifi.IsConnected()) {
+            return "Sin conexión";
+        }
+        return "Red: " + wifi.GetSsid() + "\nIP: " + wifi.GetIpAddress() +
+               "\nSeñal: " + std::to_string(wifi.GetRssi()) + " dBm";
+    }
+
+    std::string StatusInfo() {
+        int level = 0;
+        bool charging = false, discharging = false;
+        GetBatteryLevel(level, charging, discharging);
+        std::string text = "Batería: " + std::to_string(level) + " %";
+        if (charging) {
+            text += " (cargando)";
+        }
+        return text + "\nVersión: " + esp_app_get_description()->version;
+    }
+
+    void InitializeMenu() {
+        ring_ = std::make_unique<LevelRing>(display_);
+        auto backlight = GetBacklight();
+        std::vector<PetMenuItem> items = {
+            {.kind = PetMenuItem::kAdjust, .label = "Brillo",
+             .get = [backlight]() { return (int)backlight->brightness(); },
+             .set = [backlight](int value) { backlight->SetBrightness(value, true); }},
+            {.kind = PetMenuItem::kChoose, .label = "Fondo",
+             .get = [this]() { return display_->BackgroundIndex(); },
+             .set = [this](int index) { display_->SetBackground(index); },
+             .options = [this]() { return display_->BackgroundLabels(); },
+             .choosing = [this](bool on) { display_->SetPetHidden(on); }},
+            {.kind = PetMenuItem::kConfirm, .label = "Nueva charla",
+             .action = []() { Application::GetInstance().WakeWordInvoke(kNewChatCommand); }},
+            {.kind = PetMenuItem::kInfo, .label = "Wi-Fi", .info = [this]() { return NetworkInfo(); }},
+            {.kind = PetMenuItem::kAction, .label = "Reconectar wifi", .action = [this]() { ReconnectWifi(); }},
+            {.kind = PetMenuItem::kConfirm, .label = "Cambiar wifi", .action = [this]() { EnterWifiConfigMode(); }},
+            {.kind = PetMenuItem::kInfo, .label = "Estado", .info = [this]() { return StatusInfo(); }},
+            {.kind = PetMenuItem::kConfirm, .label = "Reiniciar",
+             .action = []() { Application::GetInstance().Reboot(); }},
+            {.kind = PetMenuItem::kConfirm, .label = "Apagar", .action = [this]() { PowerOff(); }},
+            {.kind = PetMenuItem::kAction, .label = "Salir", .action = []() {}},
+        };
+        menu_ = std::make_unique<PetMenu>(display_, ring_.get(), std::move(items));
+    }
+
+    void InitializeTools() {
+        McpServer::GetInstance().AddTool("self.screen.set_background",
+            "Change the background behind Bixo on the screen, by name.",
+            PropertyList({Property("name", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ToolResult {
+                auto name = properties["name"].value<std::string>();
+                if (!display_->SetBackground(name)) {
+                    return std::unexpected("Unknown background: " + name);
+                }
+                return true;
+            });
+    }
+
 public:
     SensecapWatcher() {
         ESP_LOGI(TAG, "Initialize Sensecap Watcher");
@@ -599,11 +1155,14 @@ public:
         InitializeI2c();
         InitializeSpi();
         InitializeExpander();
-        InitializeCmd();  //工厂生产测试使用
+        InitializeCmd();  //used for factory production testing
         InitializeButton();
         InitializeKnob();
         Initializespd2010Display();
-        GetBacklight()->RestoreBrightness();  // 对于不带摄像头的版本，InitializeCamera需要3s, 所以先恢复背光亮度
+        InitializeMenu();
+        InitializeTools();
+        InitializeTouch();
+        GetBacklight()->RestoreBrightness();  // On versions without a camera, InitializeCamera takes 3s, so restore the backlight brightness first
         InitializeCamera();
     }
 
@@ -633,9 +1192,9 @@ public:
         return &backlight;
     }
 
-    // 根据 https://github.com/Seeed-Studio/OSHW-SenseCAP-Watcher/blob/main/Hardware/SenseCAP_Watcher_v1.0_SCH.pdf
-    // RGB LED型号为 ws2813 mini, 连接在GPIO 40，供电电压 3.3v, 没有连接 BIN 双信号线
-    // 可以直接兼容SingleLED采用的ws2812
+    // Per https://github.com/Seeed-Studio/OSHW-SenseCAP-Watcher/blob/main/Hardware/SenseCAP_Watcher_v1.0_SCH.pdf
+    // The RGB LED is a ws2813 mini on GPIO 40, powered at 3.3v, with the BIN backup signal line not connected
+    // so it is directly compatible with the ws2812 driver used by SingleLED
     virtual Led* GetLed() override {
         static SingleLed led(BUILTIN_LED_GPIO);
         return &led;
@@ -670,5 +1229,5 @@ public:
 
 DECLARE_BOARD(SensecapWatcher);
 
-// 定义静态成员变量
+// Define the static member variable
 SensecapWatcher* SensecapWatcher::instance_ = nullptr;
