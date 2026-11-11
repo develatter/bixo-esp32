@@ -1,4 +1,5 @@
 #include "sensecap_audio_codec.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -8,7 +9,8 @@ static const char TAG[] = "SensecapAudioCodec";
 
 SensecapAudioCodec::SensecapAudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
     gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
-    gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7243e_addr, bool input_reference) {
+    gpio_num_t pa_pin, uint8_t es8311_addr, uint8_t es7243e_addr, bool input_reference,
+    std::function<void(bool)> amplifier_power) : amplifier_power_(std::move(amplifier_power)) {
     duplex_ = true; // duplex mode
     input_reference_ = input_reference; // use reference input for echo cancellation
     input_channels_ = input_reference_ ? 2 : 1; // number of input channels
@@ -75,6 +77,11 @@ SensecapAudioCodec::SensecapAudioCodec(void* i2c_master_handle, int input_sample
     esp_codec_set_disable_when_closed(output_dev_, false);
     esp_codec_set_disable_when_closed(input_dev_, false);
 
+    amplifier_power_(false);  // powered only while the output is open
+    // The channels start enabled, which keeps the chip out of light sleep until the first
+    // conversation closes them; opening the input or output enables them again.
+    i2s_channel_disable(tx_handle_);
+    i2s_channel_disable(rx_handle_);
     ESP_LOGI(TAG, "SensecapAudioDevice initialized");
 }
 
@@ -148,6 +155,16 @@ void SensecapAudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, 
     ESP_LOGI(TAG, "Duplex channels created");
 }
 
+// The stock codec turns a saved volume of 0 into 10. Here 0 is a setting of its own (replies
+// as text only), so it survives a restart.
+void SensecapAudioCodec::Start() {
+    AudioCodec::Start();
+    Settings settings("audio", false);
+    if (settings.GetInt("output_volume", -1) == 0) {
+        output_volume_ = 0;
+    }
+}
+
 void SensecapAudioCodec::SetOutputVolume(int volume) {
     ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
     AudioCodec::SetOutputVolume(volume);
@@ -188,11 +205,13 @@ void SensecapAudioCodec::EnableOutput(bool enable) {
         };
         ESP_ERROR_CHECK(esp_codec_dev_open(output_dev_, &fs));
         ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, output_volume_));
+        amplifier_power_(true);
         if (pa_pin_ != GPIO_NUM_NC) {
             gpio_set_level(pa_pin_, 1);
         }
     } 
     else {
+        amplifier_power_(false);
         ESP_ERROR_CHECK(esp_codec_dev_close(output_dev_));
         if (pa_pin_ != GPIO_NUM_NC) {
             gpio_set_level(pa_pin_, 0);

@@ -4,7 +4,6 @@
 #include "sensecap_audio_codec.h"
 #include "display/lcd_display.h"
 #include "application.h"
-#include "knob.h"
 #include "config.h"
 #include "led/single_led.h"
 #include "power_save_timer.h"
@@ -28,14 +27,17 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <iot_button.h>
-#include <iot_knob.h>
 #include <esp_io_expander_tca95xx_16bit.h>
 #include <esp_sleep.h>
+#include <esp_pm.h>
+#include <esp_lvgl_port.h>
 #include <esp_console.h>
 #include <esp_mac.h>
 #include <nvs_flash.h>
 #include <esp_app_desc.h>
+#include <cJSON.h>
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -95,10 +97,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             // The sprites draw the body below the middle of the canvas (it sits on the ground).
             lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -kBodyOffset);
 
-            // Move the bottom dialog for the round screen so the rounded corners don't clip it
-            lv_obj_set_style_pad_bottom(bottom_bar_, 30, 0);
-            lv_obj_set_width(chat_message_label_, LV_HOR_RES * 0.75); // limit the width so text doesn't touch the edge
-            lv_obj_set_style_text_line_space(chat_message_label_, 6, 0);
+            // Subtitles go to PetSubtitles: the stock one-line bar stays hidden.
+            lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+            subtitles_ = std::make_unique<PetSubtitles>(this, lv_screen_active());
             UsePixelFont();
             LoadBackground();
         }
@@ -123,11 +124,69 @@ class CustomLcdDisplay : public SpiLcdDisplay {
             DisplayLockGuard lock(this);
             pet_hidden_ = hidden;
             UpdateShadow();
-            bool subtitle = lv_label_get_text(chat_message_label_)[0] != '\0';
-            for (lv_obj_t* obj : {emoji_box_, bottom_bar_, status_bar_}) {
-                bool show = !hidden && (obj != bottom_bar_ || subtitle);  // an empty bar stays hidden
-                show ? lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN) : lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+            for (lv_obj_t* obj : {emoji_box_, status_bar_}) {
+                hidden ? lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN) : lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
             }
+            if (subtitles_) {
+                subtitles_->SetHidden(hidden);
+            }
+        }
+
+        virtual void SetChatMessage(const char* role, const char* content) override {
+            DisplayLockGuard lock(this);
+            if (subtitles_) {
+                subtitles_->Set(role, content ? content : "");
+            }
+        }
+
+        // Whether replies are spoken (the menu's voice switch) or only shown as text.
+        void SetVoice(bool on) { voice_ = on; }
+
+        // The app clears the subtitles when it goes idle: let them linger and leave by themselves,
+        // soon if the reply was heard, later if it was only text (voice off or volume at 0).
+        virtual void ClearChatMessages() override {
+            bool heard = voice_ && Board::GetInstance().GetAudioCodec()->output_volume() > 0;
+            DisplayLockGuard lock(this);
+            if (subtitles_) {
+                subtitles_->Finish(heard ? kHeardLingerMs : kReadLingerMs);
+            }
+        }
+
+        virtual void RemoveChatMessage(const char* role, const char* content) override {
+            DisplayLockGuard lock(this);
+            if (subtitles_ && content != nullptr && subtitles_->Text() == content) {
+                subtitles_->Clear();
+            }
+        }
+
+        bool SubtitlesShown() {
+            DisplayLockGuard lock(this);
+            return subtitles_ && subtitles_->Shown();
+        }
+
+        bool InSubtitles(int x, int y) {
+            DisplayLockGuard lock(this);
+            return subtitles_ && subtitles_->InText(x, y);
+        }
+
+        void ScrollSubtitles(int lines) {
+            DisplayLockGuard lock(this);
+            subtitles_->Scroll(lines);
+        }
+
+        void DragSubtitlesStart() {
+            DisplayLockGuard lock(this);
+            subtitles_->DragStart();
+        }
+
+        void DragSubtitles(int dy) {
+            DisplayLockGuard lock(this);
+            subtitles_->Drag(dy);
+        }
+
+        void DismissSubtitles() {
+            DisplayLockGuard lock(this);
+            subtitles_->Clear();
         }
 
         std::vector<std::string> BackgroundLabels() {
@@ -169,11 +228,16 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                           strcmp(status, Lang::Strings::SPEAKING) == 0;
             connecting_ = strcmp(status, Lang::Strings::CONNECTING) == 0;
             listening_ = strcmp(status, Lang::Strings::LISTENING) == 0;
+            bool speaking = strcmp(status, Lang::Strings::SPEAKING) == 0;
+            bool speaking_changed = speaking_.exchange(speaking) != speaking;
             error_ = error;
             if (error) {
                 StartErrorTimer();
             }
             SpiLcdDisplay::SetStatus(silent ? "" : status);
+            if (speaking_changed) {
+                ShowEmotion();
+            }
         }
 
         bool ShowingError() const { return error_; }
@@ -237,6 +301,8 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         }
 
         PetBackground background_;
+        std::unique_ptr<PetSubtitles> subtitles_;
+        std::atomic<bool> voice_{false};
 
         // The saved background, or the first one.
         void LoadBackground() {
@@ -255,14 +321,16 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 return false;
             }
             const auto& info = background_.list()[index];
-            lv_obj_set_style_bg_color(bottom_bar_, info.panel, 0);
-            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_60, 0);
-            lv_obj_set_style_text_color(chat_message_label_, info.text, 0);
+            if (subtitles_) {
+                subtitles_->SetColors(info.panel, info.text);
+            }
             lv_obj_set_style_text_color(status_label_, info.text, 0);
             lv_obj_set_style_text_color(notification_label_, info.text, 0);
             return true;
         }
 
+        static constexpr int kHeardLingerMs = 1500;  // subtitles after a spoken reply
+        static constexpr int kReadLingerMs = 6000;   // after a reply shown only as text
         static constexpr int kBodyOffset = 39;      // px from the canvas centre to the body's
         static constexpr int kExhaustedLevel = 10;  // % (discharging) for the exhausted face
         static constexpr int kHysteresis = 3;       // % to climb back past a boundary
@@ -280,6 +348,7 @@ class CustomLcdDisplay : public SpiLcdDisplay {
         static constexpr int64_t kErrorShownUs = 8 * 1000 * 1000;
         std::atomic<bool> connecting_{false};
         std::atomic<bool> listening_{false};
+        std::atomic<bool> speaking_{false};
         std::atomic<bool> error_{false};
         esp_timer_handle_t error_timer_ = nullptr;
 
@@ -319,6 +388,9 @@ class CustomLcdDisplay : public SpiLcdDisplay {
                 emotion = "connecting";
             } else if (listening_ && emotion == "neutral") {
                 emotion = "listening";
+            } else if (speaking_ && (emotion == "neutral" || emotion == "thinking")) {
+                // Thinking is the face while the reply is on its way; once it talks, it talks.
+                emotion = "speaking";
             } else if (exhausted_ && (emotion == "neutral" || emotion == "sleepy")) {
                 // Only the resting faces: a tap or a reply still shows, just very grey.
                 emotion = "exhausted";
@@ -347,18 +419,23 @@ class CustomLcdDisplay : public SpiLcdDisplay {
 class SensecapWatcher : public WifiBoard {
 private:
     static constexpr uint32_t kVolumeColor = 0x3DDC84;
-    static constexpr int kVolumeStep = 5;
-    static constexpr int64_t kKnobReverseUs = 120 * 1000;
+    static constexpr int kVolumeStep = 5;  // one ring segment per notch
+    static constexpr int kKnobPollAwakeUs = 1000;
+    static constexpr int kKnobPollRestingUs = 3000;  // resting it only has to notice a turn
     static constexpr int64_t kLongPressUs = 700 * 1000;
+    static constexpr int kDragSlop = 10;  // px a finger moves before a touch becomes a drag
+    static constexpr int64_t kRebootHoldUs = 8 * 1000 * 1000;  // after the 2 s power-off press
+    static constexpr int kLowBatteryPolls = 5;                  // battery polls run every second
+    static constexpr int kFlatBatteryLevel = 5;                 // %: below it, power off
     // Sent as if it were a wake word; the server starts a new conversation with Hermes.
     static constexpr const char* kNewChatCommand = "<nueva charla>";
 
     i2c_master_bus_handle_t i2c_bus_;
     CustomLcdDisplay* display_;
-    std::unique_ptr<Knob> knob_;
-    int knob_direction_ = 0;
-    bool knob_reverse_pending_ = false;
-    int64_t knob_last_us_ = 0;
+    esp_timer_handle_t knob_timer_ = nullptr;
+    uint8_t knob_state_ = 0;   // the lines' levels, A << 1 | B
+    int knob_travel_ = 0;      // transitions since the last detent
+    int knob_last_dir_ = 0;
     std::atomic<int> knob_steps_{0};
     std::atomic<bool> knob_scheduled_{false};
     std::atomic<bool> wifi_reconnecting_{false};
@@ -368,6 +445,11 @@ private:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     std::atomic<bool> screen_off_{false};
+    bool resting_ = false;  // main task only
+    esp_pm_lock_handle_t awake_cpu_lock_ = nullptr;
+    esp_pm_lock_handle_t awake_sleep_lock_ = nullptr;
+    int64_t long_press_since_us_ = 0;
+    int low_battery_polls_ = 0;
     button_driver_t* btn_driver_ = nullptr;
     static SensecapWatcher* instance_;
     SscmaCamera* camera_ = nullptr;
@@ -378,6 +460,7 @@ private:
     int tap_streak_ = 0;
     std::unique_ptr<LevelRing> ring_;
     std::unique_ptr<PetMenu> menu_;
+    std::atomic<bool> voice_{false};  // replies spoken, not only shown; saved, off by default
 
     // Idle on battery, the screen dims after a minute and goes dark after five; any input wakes
     // it. The Watcher never powers itself off: that is up to the user (or a flat battery).
@@ -390,6 +473,7 @@ private:
         power_save_timer_->OnExitSleepMode([this]() {
             screen_off_ = false;
             GetDisplay()->SetPowerSaveMode(false);
+            Application::GetInstance().Schedule([this]() { SetResting(false); });
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() { TurnScreenOff(); });
@@ -457,6 +541,8 @@ private:
         ret |= esp_io_expander_set_level(io_exp_handle, BSP_PWR_SYSTEM, 1);
         vTaskDelay(100 / portTICK_PERIOD_MS);
         ret |= esp_io_expander_set_level(io_exp_handle, BSP_PWR_START_UP, 1);
+        // Nothing uses the SD card or the Grove port: leave them unpowered.
+        ret |= esp_io_expander_set_level(io_exp_handle, BSP_PWR_SDCARD | BSP_PWR_GROVE, 0);
         vTaskDelay(50 / portTICK_PERIOD_MS);
     
         uint32_t pin_val = 0;
@@ -466,27 +552,44 @@ private:
         assert(ret == ESP_OK);
     }
 
-    // Runs in the knob's polling timer, which decodes the encoder in software: keep it short
-    // or steps get lost and read backwards. Steps are added up and applied in the main task.
-    void OnKnobRotate(bool clockwise) {
-        int step = clockwise ? -1 : 1;  // +1 turns the volume up and moves up the menu
-        int64_t now = esp_timer_get_time();
-        // A lone step against the way the wheel is turning is a decoding glitch; two in a row
-        // are the wheel really turning back.
-        bool reversing = step != knob_direction_ && now - knob_last_us_ < kKnobReverseUs;
-        knob_last_us_ = now;
-        if (reversing && !knob_reverse_pending_) {
-            knob_reverse_pending_ = true;
+    // The wheel is a quadrature encoder that rests in a detent whenever both lines read the
+    // same, two transitions apart. Polled in the esp_timer task (it keeps running while resting,
+    // so a turn wakes the chip up): each transition counts +-1 and a step is taken as soon as the
+    // wheel settles in a detent, the way it went. Contact bounce cancels out; a reading that
+    // missed a transition (both lines changed) counts as two the way the wheel was going.
+    void PollKnob() {
+        uint8_t state = (gpio_get_level(BSP_KNOB_A_PIN) << 1) | gpio_get_level(BSP_KNOB_B_PIN);
+        if (state == knob_state_) {
             return;
         }
-        knob_reverse_pending_ = false;
-        knob_direction_ = step;
-        knob_steps_ += step;
+        // Indexed by old << 2 | new. -1 runs 00 -> 10 -> 11 -> 01: clockwise.
+        static constexpr int8_t kTransition[16] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
+        int delta = kTransition[(knob_state_ << 2) | state];
+        if (delta == 0) {
+            delta = 2 * knob_last_dir_;
+        } else {
+            knob_last_dir_ = delta;
+        }
+        knob_state_ = state;
+        knob_travel_ += delta;
+        if (state == 0b00 || state == 0b11) {
+            if (knob_travel_ != 0) {
+                OnKnobStep(knob_travel_ < 0);
+            }
+            knob_travel_ = 0;
+        }
+    }
+
+    // Steps add up here and are applied in the main task, so the poll stays short.
+    void OnKnobStep(bool clockwise) {
+        knob_steps_ += clockwise ? 1 : -1;
         if (!knob_scheduled_.exchange(true)) {
             Application::GetInstance().Schedule([this]() { ApplyKnobSteps(); });
         }
     }
 
+    // Wheel notches, +1 clockwise: volume and brightness up, the next icon clockwise in the menu,
+    // the next line of the subtitles.
     void ApplyKnobSteps() {
         knob_scheduled_ = false;
         int steps = knob_steps_.exchange(0);
@@ -495,6 +598,11 @@ private:
         }
         if (MenuOpen()) {
             menu_->Move(steps);
+            return;
+        }
+        // With subtitles on screen the wheel scrolls them; the volume waits until they are gone.
+        if (display_->SubtitlesShown()) {
+            display_->ScrollSubtitles(steps);
             return;
         }
         auto codec = GetAudioCodec();
@@ -506,12 +614,25 @@ private:
     }
 
     void InitializeKnob() {
-        knob_ = std::make_unique<Knob>(BSP_KNOB_A_PIN, BSP_KNOB_B_PIN);
-        knob_->OnRotate([this](bool clockwise) {
-            ESP_LOGD(TAG, "Knob rotation detected. Clockwise:%s", clockwise ? "true" : "false");
-            OnKnobRotate(clockwise);
-        });
-        ESP_LOGI(TAG, "Knob initialized with pins A:%d B:%d", BSP_KNOB_A_PIN, BSP_KNOB_B_PIN);
+        gpio_config_t config = {
+            .pin_bit_mask = (1ULL << BSP_KNOB_A_PIN) | (1ULL << BSP_KNOB_B_PIN),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&config));
+        knob_state_ = (gpio_get_level(BSP_KNOB_A_PIN) << 1) | gpio_get_level(BSP_KNOB_B_PIN);
+        esp_timer_create_args_t args = {
+            .callback = [](void* arg) { static_cast<SensecapWatcher*>(arg)->PollKnob(); },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "knob",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&args, &knob_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(knob_timer_, kKnobPollAwakeUs));
+        ESP_LOGI(TAG, "Knob on pins A:%d B:%d", BSP_KNOB_A_PIN, BSP_KNOB_B_PIN);
     }
 
     void InitializeButton() {
@@ -548,6 +669,10 @@ private:
 
             if (self->display_->ShowingError()) {
                 Application::GetInstance().Schedule([self]() { self->display_->DismissError(); });
+                return;
+            }
+            if (self->display_->SubtitlesShown()) {
+                self->display_->DismissSubtitles();
                 return;
             }
 
@@ -592,10 +717,21 @@ private:
             Application::GetInstance().ToggleConversation();
         }, this);
         
-        // Holding the button powers off. There is no factory reset on the button: it is too easy
-        // to trigger while trying to switch off a plugged-in Watcher (see the factory_reset command).
+        // Holding the button powers off; still held after kRebootHoldUs, it restarts (the way out
+        // of a stuck screen with the charger plugged in, which keeps the power on). There is no
+        // factory reset on the button: it is in the menu.
         iot_button_register_cb(btns, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
-            static_cast<SensecapWatcher*>(usr_data)->PowerOff();
+            auto self = static_cast<SensecapWatcher*>(usr_data);
+            self->long_press_since_us_ = esp_timer_get_time();
+            self->PowerOff();
+        }, this);
+
+        iot_button_register_cb(btns, BUTTON_LONG_PRESS_HOLD, nullptr, [](void* button_handle, void* usr_data) {
+            auto self = static_cast<SensecapWatcher*>(usr_data);
+            if (esp_timer_get_time() - self->long_press_since_us_ >= kRebootHoldUs) {
+                ESP_LOGI(TAG, "Button held: restarting");
+                esp_restart();
+            }
         }, this);
     }
 
@@ -753,9 +889,7 @@ private:
             .func = NULL,
             .argtable = NULL,
             .func_w_context = [](void *context,int argc, char** argv) -> int {
-                auto self = static_cast<SensecapWatcher*>(context);
-                self->GetBacklight()->SetBrightness(0);
-                self->IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);
+                static_cast<SensecapWatcher*>(context)->CutPower("console");
                 return 0;
             },
             .context =this
@@ -790,6 +924,18 @@ private:
             .context =this
         };
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmd4));
+
+        const esp_console_cmd_t cmd_pm = {
+            .command = "pm",
+            .help = "list the power management locks",
+            .hint = NULL,
+            .func = [](int argc, char** argv) -> int {
+                esp_pm_dump_locks(stdout);
+                return 0;
+            },
+            .argtable = NULL,
+        };
+        ESP_ERROR_CHECK(esp_console_cmd_register(&cmd_pm));
 
         const esp_console_cmd_t cmd5 = {
             .command = "read_mac",
@@ -946,13 +1092,21 @@ private:
         };
         ESP_ERROR_CHECK(esp_timer_create(&timer_args, &touch_reaction_timer_));
 
-        // A short touch is a tap (on release); holding it opens the menu.
+        // A short touch is a tap (on release); holding it opens the menu. With the screen off the
+        // touch controller is off too (it is part of the panel): only the wheel wakes Bixo.
         xTaskCreate([](void* arg) {
             auto self = static_cast<SensecapWatcher*>(arg);
             int64_t pressed_since = 0;  // 0 = not touching
-            bool held = false;
+            bool held = false;          // long press or drag: no tap on release
+            bool on_subtitles = false;  // the touch started on the subtitles: it may drag them
+            int start_y = 0;
             esp_lcd_touch_point_data_t point = {};
             while (true) {
+                if (self->screen_off_) {
+                    pressed_since = 0;
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
                 esp_lcd_touch_point_data_t now_point;
                 uint8_t count = 0;
                 if (esp_lcd_touch_read_data(self->touch_) == ESP_OK) {
@@ -963,9 +1117,19 @@ private:
                     if (pressed_since == 0) {
                         pressed_since = now;
                         held = false;
+                        start_y = now_point.y;
+                        on_subtitles = !self->MenuOpen() && self->display_->InSubtitles(now_point.x, now_point.y);
+                        if (on_subtitles) {
+                            self->display_->DragSubtitlesStart();
+                        }
                     }
                     point = now_point;
-                    if (!held && now - pressed_since >= kLongPressUs) {
+                    int dy = (int)now_point.y - start_y;
+                    if (on_subtitles && (held || std::abs(dy) > kDragSlop)) {
+                        held = true;
+                        self->power_save_timer_->WakeUp();
+                        self->display_->DragSubtitles(dy);
+                    } else if (!held && now - pressed_since >= kLongPressUs) {
                         held = true;
                         self->OnLongPress();
                     }
@@ -983,15 +1147,20 @@ private:
 
     // A tap pets Bixo while it's idle: happy, then loving, then giggling if you keep at it.
     void OnTap(uint16_t x, uint16_t y) {
-        if (WakeOnInput()) {
-            return;
-        }
+        power_save_timer_->WakeUp();
         if (MenuOpen()) {
             Application::GetInstance().Schedule([this, x, y]() { menu_->Tap(x, y); });
             return;
         }
         if (display_->ShowingError()) {
             Application::GetInstance().Schedule([this]() { display_->DismissError(); });
+            return;
+        }
+        // A tap off the subtitles puts them away; on them it does nothing (they are for reading).
+        if (display_->SubtitlesShown()) {
+            if (!display_->InSubtitles(x, y)) {
+                display_->DismissSubtitles();
+            }
             return;
         }
         int64_t now = esp_timer_get_time();
@@ -1019,9 +1188,7 @@ private:
 
     void OnLongPress() {
         ESP_LOGI(TAG, "Long press");
-        if (WakeOnInput()) {
-            return;
-        }
+        power_save_timer_->WakeUp();
         Application::GetInstance().Schedule([this]() {
             if (!menu_->IsOpen()) {
                 // The timer that would end a tap reaction is stopped: end it now.
@@ -1070,31 +1237,100 @@ private:
             TurnScreenOff();
             return;
         }
-        ESP_LOGI(TAG, "Power off");
+        CutPower("button or menu");
+    }
+
+    // Leaves the reason for the next boot to log: a Watcher found off with none was hung or lost
+    // power some other way.
+    void CutPower(const char* reason) {
+        ESP_LOGI(TAG, "Power off: %s", reason);
+        {
+            Settings settings("pet", true);
+            settings.SetString("last_off", reason);
+        }
         IoExpanderSetLevel(BSP_PWR_LCD, 0);
         IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);
     }
 
-    // A dark screen the next click, turn or touch lights up again.
-    void TurnScreenOff() {
-        screen_off_ = true;
-        GetBacklight()->SetBrightness(0);
+    static void LogLastPowerOff() {
+        Settings settings("pet", true);
+        std::string reason = settings.GetString("last_off");
+        ESP_LOGI(TAG, "Reset reason %d, last power off: %s", (int)esp_reset_reason(),
+                 reason.empty() ? "none recorded" : reason.c_str());
+        if (!reason.empty()) {
+            settings.EraseKey("last_off");
+        }
     }
 
-    // Every input goes through here first. Returns true when it only woke the screen up.
+    // A dark screen the next click or turn of the wheel lights up again.
+    void TurnScreenOff() {
+        screen_off_ = true;
+        Application::GetInstance().Schedule([this]() { SetResting(true); });
+    }
+
+    // Every wheel input goes through here first. Returns true when it only woke the screen up.
     bool WakeOnInput() {
         bool was_off = screen_off_.exchange(false);
         power_save_timer_->WakeUp();
         if (was_off) {
-            Application::GetInstance().Schedule([this]() { GetBacklight()->RestoreBrightness(); });
+            Application::GetInstance().Schedule([this]() { SetResting(false); });
         }
         return was_off;
+    }
+
+    // Awake, the chip runs at full speed. Resting, it drops to 40 MHz and light-sleeps between
+    // timer ticks: Wi-Fi stays connected and the wheel and button keep being read, so it wakes
+    // at once. The two locks are held while awake.
+    void InitializePowerManagement() {
+        esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "awake_cpu", &awake_cpu_lock_);
+        esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "awake_sleep", &awake_sleep_lock_);
+        esp_pm_lock_acquire(awake_cpu_lock_);
+        esp_pm_lock_acquire(awake_sleep_lock_);
+        esp_pm_config_t pm_config = {
+            .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+            .min_freq_mhz = 40,
+            .light_sleep_enable = true,
+        };
+        esp_err_t err = esp_pm_configure(&pm_config);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Power management unavailable: %s", esp_err_to_name(err));
+        }
+    }
+
+    // Screen off: stop drawing, switch the panel off and let the chip sleep. Main task only.
+    void SetResting(bool resting) {
+        if (resting == resting_) {
+            return;
+        }
+        resting_ = resting;
+        ESP_LOGI(TAG, "%s", resting ? "Resting" : "Awake");
+        if (resting) {
+            GetBacklight()->SetBrightness(0);
+            {
+                DisplayLockGuard lock(display_);
+                esp_lcd_panel_disp_on_off(panel_, false);
+            }
+            lvgl_port_stop();
+            esp_timer_restart(knob_timer_, kKnobPollRestingUs);
+            esp_pm_lock_release(awake_sleep_lock_);
+            esp_pm_lock_release(awake_cpu_lock_);
+        } else {
+            esp_pm_lock_acquire(awake_cpu_lock_);
+            esp_pm_lock_acquire(awake_sleep_lock_);
+            esp_timer_restart(knob_timer_, kKnobPollAwakeUs);
+            lvgl_port_resume();
+            {
+                DisplayLockGuard lock(display_);
+                esp_lcd_panel_disp_on_off(panel_, true);
+            }
+            GetBacklight()->RestoreBrightness();
+        }
     }
 
     std::string NetworkInfo() {
         auto& wifi = WifiManager::GetInstance();
         if (!wifi.IsConnected()) {
-            return "Sin conexión";
+            return "Wi-Fi: sin conexión";
         }
         return "Red: " + wifi.GetSsid() + "\nIP: " + wifi.GetIpAddress() +
                "\nSeñal: " + std::to_string(wifi.GetRssi()) + " dBm";
@@ -1111,30 +1347,53 @@ private:
         return text + "\nVersión: " + esp_app_get_description()->version;
     }
 
+    void LoadVoice() {
+        Settings settings("pet");
+        voice_ = settings.GetInt("voice", 0) != 0;
+        display_->SetVoice(voice_);
+    }
+
+    void SetVoice(bool on) {
+        ESP_LOGI(TAG, "Voice %s", on ? "on" : "off");
+        voice_ = on;
+        display_->SetVoice(on);
+        Settings settings("pet", true);
+        settings.SetInt("voice", on ? 1 : 0);
+    }
+
+    // Clockwise from the top: leaving, the settings, the chat, the network, information and the
+    // device itself.
     void InitializeMenu() {
+        LoadVoice();
         ring_ = std::make_unique<LevelRing>(display_);
         auto backlight = GetBacklight();
         std::vector<PetMenuItem> items = {
-            {.kind = PetMenuItem::kAdjust, .label = "Brillo",
-             .get = [backlight]() { return (int)backlight->brightness(); },
+            {.kind = PetMenuItem::kAction, .label = "Salir", .icon = &pet_icon_salir, .action = []() {}},
+            {.kind = PetMenuItem::kToggle, .label = "Voz", .icon = &pet_icon_voz_on, .icon_off = &pet_icon_voz_off,
+             .get = [this]() { return voice_ ? 1 : 0; },
+             .set = [this](int on) { SetVoice(on != 0); }},
+            {.kind = PetMenuItem::kAdjust, .label = "Brillo", .icon = &pet_icon_brillo,
+             .get = [backlight]() { return (int)backlight->target_brightness(); },
              .set = [backlight](int value) { backlight->SetBrightness(value, true); }},
-            {.kind = PetMenuItem::kChoose, .label = "Fondo",
+            {.kind = PetMenuItem::kChoose, .label = "Fondo", .icon = &pet_icon_fondo,
              .get = [this]() { return display_->BackgroundIndex(); },
              .set = [this](int index) { display_->SetBackground(index); },
              .options = [this]() { return display_->BackgroundLabels(); },
              .choosing = [this](bool on) { display_->SetPetHidden(on); }},
-            {.kind = PetMenuItem::kConfirm, .label = "Nueva charla",
+            {.kind = PetMenuItem::kConfirm, .label = "Nueva charla", .icon = &pet_icon_charla,
              .action = []() { Application::GetInstance().WakeWordInvoke(kNewChatCommand); }},
-            {.kind = PetMenuItem::kInfo, .label = "Wi-Fi", .info = [this]() { return NetworkInfo(); }},
-            {.kind = PetMenuItem::kAction, .label = "Reconectar wifi", .action = [this]() { ReconnectWifi(); }},
-            {.kind = PetMenuItem::kConfirm, .label = "Cambiar wifi", .action = [this]() { EnterWifiConfigMode(); }},
-            {.kind = PetMenuItem::kConfirm, .label = "Restablecer", .action = []() { FactoryReset(); },
-             .warning = "Borra wifi y ajustes"},
-            {.kind = PetMenuItem::kInfo, .label = "Estado", .info = [this]() { return StatusInfo(); }},
-            {.kind = PetMenuItem::kConfirm, .label = "Reiniciar",
+            {.kind = PetMenuItem::kAction, .label = "Reconectar", .icon = &pet_icon_reconectar,
+             .action = [this]() { ReconnectWifi(); }},
+            {.kind = PetMenuItem::kConfirm, .label = "Cambiar wifi", .icon = &pet_icon_cambiar_wifi,
+             .action = [this]() { EnterWifiConfigMode(); }},
+            {.kind = PetMenuItem::kInfo, .label = "Info", .icon = &pet_icon_info,
+             .info = [this]() { return NetworkInfo() + "\n" + StatusInfo(); }},
+            {.kind = PetMenuItem::kConfirm, .label = "Restablecer", .icon = &pet_icon_restablecer,
+             .action = []() { FactoryReset(); }, .warning = "Borra wifi y ajustes"},
+            {.kind = PetMenuItem::kConfirm, .label = "Reiniciar", .icon = &pet_icon_reiniciar,
              .action = []() { Application::GetInstance().Reboot(); }},
-            {.kind = PetMenuItem::kConfirm, .label = "Apagar", .action = [this]() { PowerOff(); }},
-            {.kind = PetMenuItem::kAction, .label = "Salir", .action = []() {}},
+            {.kind = PetMenuItem::kConfirm, .label = "Apagar", .icon = &pet_icon_apagar,
+             .action = [this]() { PowerOff(); }},
         };
         menu_ = std::make_unique<PetMenu>(display_, ring_.get(), std::move(items));
     }
@@ -1155,6 +1414,8 @@ private:
 public:
     SensecapWatcher() {
         ESP_LOGI(TAG, "Initialize Sensecap Watcher");
+        LogLastPowerOff();
+        InitializePowerManagement();
         InitializePowerSaveTimer();
         InitializeI2c();
         InitializeSpi();
@@ -1183,7 +1444,8 @@ public:
             AUDIO_CODEC_PA_PIN, 
             AUDIO_CODEC_ES8311_ADDR, 
             AUDIO_CODEC_ES7243E_ADDR, 
-            AUDIO_INPUT_REFERENCE);
+            AUDIO_INPUT_REFERENCE,
+            [this](bool on) { IoExpanderSetLevel(BSP_PWR_CODEC_PA, on); });
         return &audio_codec;
     }
 
@@ -1204,8 +1466,13 @@ public:
         return &led;
     }
 
+    // Leaving low power means a conversation is starting: it needs the chip awake, so a dark
+    // screen (switched off while charging, say) lights up too.
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
         if (level != PowerSaveLevel::LOW_POWER) {
+            if (screen_off_.exchange(false)) {
+                Application::GetInstance().Schedule([this]() { SetResting(false); });
+            }
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveLevel(level);
@@ -1218,15 +1485,33 @@ public:
 
         // Dimming is for battery only; plugged in the screen stays at full brightness.
         power_save_timer_->SetEnabled(discharging);
-        if (level <= 1  &&  discharging) {
-            ESP_LOGI(TAG, "Battery level is low, shutting down");
-            IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);
+        // One bad reading must not switch it off: the battery has to stay flat for a few polls.
+        low_battery_polls_ = (level <= kFlatBatteryLevel && discharging) ? low_battery_polls_ + 1 : 0;
+        if (low_battery_polls_ >= kLowBatteryPolls) {
+            CutPower("battery flat");
         }
         return true;
     }
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    // The server asks before each reply whether to synthesise it: audio_speaker.voice.
+    virtual std::string GetDeviceStatusJson() override {
+        std::string json = WifiBoard::GetDeviceStatusJson();
+        cJSON* root = cJSON_Parse(json.c_str());
+        cJSON* speaker = cJSON_GetObjectItem(root, "audio_speaker");
+        if (speaker == nullptr) {
+            cJSON_Delete(root);
+            return json;
+        }
+        cJSON_AddBoolToObject(speaker, "voice", voice_);
+        char* text = cJSON_PrintUnformatted(root);
+        std::string result = text;
+        cJSON_free(text);
+        cJSON_Delete(root);
+        return result;
     }
 };
 

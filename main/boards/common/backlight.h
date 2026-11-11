@@ -15,6 +15,8 @@ public:
     void RestoreBrightness();
     void SetBrightness(uint8_t brightness, bool permanent = false);
     inline uint8_t brightness() const { return brightness_; }
+    // Where a fade is heading (brightness() changes 1 % every 5 ms until it gets there).
+    inline uint8_t target_brightness() const { return target_brightness_; }
 
 protected:
     void OnTransitionTimer();

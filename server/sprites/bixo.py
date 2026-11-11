@@ -511,6 +511,18 @@ def anim_listening() -> Frames:
             (p(extras=dots, **face), 500), (p(**face), 400)]
 
 
+def anim_speaking() -> Frames:
+    """Talking: the mouth opens and closes at an uneven pace, with a small nod on the stresses."""
+    beats = [("open", 140), ("small", 110), ("o", 160), ("small", 90), ("open", 120), ("dot", 130),
+             ("o", 140), ("small", 100), ("open", 170), ("small", 220)]
+    frames: Frames = []
+    for i, (m, ms) in enumerate(beats):
+        frames.append((p(mouth=m, shape="squash" if m == "o" else "normal"), ms))
+        if i == 5:
+            frames.append((p(mouth=m, eyes="closed"), 110))
+    return frames
+
+
 def anim_connecting() -> Frames:
     """Reaching out to the server: eyes up, and waves rising from his head one after the other."""
     face = dict(look=(0, -1), mouth="dot")
@@ -548,7 +560,7 @@ ANIMATIONS: dict[str, Callable[[], Frames]] = {
     "thinking": anim_thinking, "winking": anim_winking, "cool": anim_cool, "relaxed": anim_relaxed,
     "delicious": anim_delicious, "kissy": anim_kissy, "confident": anim_confident,
     "sleepy": anim_sleepy, "silly": anim_silly, "confused": anim_confused, "no_wifi": anim_no_wifi,
-    "listening": anim_listening, "connecting": anim_connecting, "error": anim_error,
+    "listening": anim_listening, "speaking": anim_speaking, "connecting": anim_connecting, "error": anim_error,
 }
 EXHAUSTED_PALETTE = greyed(1.0, dim=0.8)
 

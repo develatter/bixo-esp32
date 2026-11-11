@@ -36,7 +36,7 @@ static bool __himax_keepalive_check(sscma_client_handle_t client) {
     return false;
 }
 
-SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
+SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) : io_exp_handle_(io_exp_handle) {
     sscma_client_io_spi_config_t spi_io_config = {0};
     spi_io_config.sync_gpio_num = BSP_SSCMA_CLIENT_SPI_SYNC;
     spi_io_config.cs_gpio_num = BSP_SSCMA_CLIENT_SPI_CS;
@@ -286,6 +286,7 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
         SscmaCamera* self = static_cast<SscmaCamera*>(user_ctx);
         if (self) {
             self->sscma_restarted_ = true;
+            self->connected_ = true;
         }
     };
 
@@ -346,12 +347,23 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
     ESP_LOGI(TAG, "initialize mcp tools");
     InitializeMcpTools();
 
+    last_use_us_ = esp_timer_get_time();  // powered for start-up, off after the idle time
+
     xTaskCreate(
         [](void* arg) {
             auto this_ = (SscmaCamera*)arg;
             bool is_inference = false;
             int64_t last_keepalive_time = esp_timer_get_time();
             while (true) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                std::lock_guard<std::mutex> lock(this_->chip_mutex_);
+                if (this_->powered_ && !this_->inference_en &&
+                    esp_timer_get_time() - this_->last_use_us_ > kIdlePowerOffUs) {
+                    this_->PowerDown();
+                }
+                if (!this_->powered_ && !this_->inference_en) {
+                    continue;
+                }
                 if (this_->sscma_restarted_) {
                     ESP_LOGI(TAG, "SSCMA restarted detected");
                     this_->sscma_restarted_ = false;
@@ -371,6 +383,12 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                     Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
                     if (!is_inference) {
                         ESP_LOGI(TAG, "Start inference (enable=1)");
+                        if (!this_->powered_) {
+                            if (!this_->PowerUp()) {
+                                continue;
+                            }
+                            sscma_client_get_model(this_->sscma_client_handle_, &this_->model, true);
+                        }
                         sscma_client_break(this_->sscma_client_handle_);
                         sscma_client_set_model(this_->sscma_client_handle_, 4);
                         sscma_client_set_sensor(this_->sscma_client_handle_, 1, 1,
@@ -385,11 +403,43 @@ SscmaCamera::SscmaCamera(esp_io_expander_handle_t io_exp_handle) {
                              Application::GetInstance().GetDeviceState());
                     is_inference = false;
                     sscma_client_break(this_->sscma_client_handle_);
+                    this_->last_use_us_ = esp_timer_get_time();
                 }
-                vTaskDelay(pdMS_TO_TICKS(200));
             }
         },
         "sscma_camera", 4096, this, 1, nullptr);
+}
+
+bool SscmaCamera::PowerUp() {
+    if (powered_) {
+        return true;
+    }
+    ESP_LOGI(TAG, "Powering the AI chip up");
+    connected_ = false;
+    esp_io_expander_set_level(io_exp_handle_, BSP_PWR_AI_CHIP, 1);
+    sscma_client_init(sscma_client_handle_);  // resets the chip and resumes polling it
+    powered_ = true;
+    last_use_us_ = esp_timer_get_time();
+    for (int i = 0; i < 40 && !connected_; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!connected_) {
+        ESP_LOGE(TAG, "The AI chip did not come up");
+        PowerDown();
+        return false;
+    }
+    return true;
+}
+
+void SscmaCamera::PowerDown() {
+    if (!powered_) {
+        return;
+    }
+    ESP_LOGI(TAG, "Powering the AI chip down");
+    sscma_client_handle_->inited = false;  // its process task stops polling the chip
+    vTaskDelay(pdMS_TO_TICKS(30));         // let a poll in flight finish
+    esp_io_expander_set_level(io_exp_handle_, BSP_PWR_AI_CHIP, 0);
+    powered_ = false;
 }
 
 SscmaCamera::~SscmaCamera() {
@@ -517,6 +567,11 @@ bool SscmaCamera::Capture() {
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(chip_mutex_);
+    if (!PowerUp()) {
+        return false;
+    }
+    last_use_us_ = esp_timer_get_time();
     if (sscma_client_set_sensor(sscma_client_handle_, 1, 3, true)) {
         ESP_LOGE(TAG, "Failed to set sensor");
         return false;

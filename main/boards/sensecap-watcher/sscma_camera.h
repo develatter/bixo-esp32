@@ -1,8 +1,10 @@
 #ifndef SSCMA_CAMERA_H
 #define SSCMA_CAMERA_H
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include <esp_io_expander_tca95xx_16bit.h>
@@ -52,6 +54,17 @@ private:
 
     sscma_client_model_t* model;
     int model_class_cnt = 0;
+
+    // The AI chip draws power all the time, so it is switched off when unused: a photo powers
+    // it up (about a second) and the camera task switches it off after kIdlePowerOffUs.
+    static constexpr int64_t kIdlePowerOffUs = 30 * 1000 * 1000;
+    esp_io_expander_handle_t io_exp_handle_;
+    std::mutex chip_mutex_;  // held for every request to the chip and to switch it on or off
+    bool powered_ = true;
+    int64_t last_use_us_ = 0;
+    std::atomic<bool> connected_{false};  // set when the chip reports it has booted
+    bool PowerUp();    // with chip_mutex_ held
+    void PowerDown();  // with chip_mutex_ held
 
 public:
     SscmaCamera(esp_io_expander_handle_t io_exp_handle);

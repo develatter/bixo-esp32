@@ -26,6 +26,9 @@ MIC_RATE = 16000
 VAD_FRAME = MIC_RATE * 30 // 1000  # webrtcvad works on 10/20/30 ms frames
 FRAME_S = FRAME_MS / 1000
 PLAYBACK_LEAD_S = 0.3  # how far ahead of real time we let the device's buffer fill
+# With the voice off the reply is only subtitles: each one stays up long enough to read.
+READ_S_PER_CHAR = 0.07  # about the pace the device scrolls them (one 16-character line per 1.1 s)
+READ_MIN_S = 1.5
 # What the device reports when the real wake word fires; any other "detect" text is a command
 # from the device itself (the camera's "<detect>1 person detected </detect>") and is answered
 # as if heard.
@@ -208,14 +211,15 @@ class Session:
         if name not in self.mcp_tools:
             raise RuntimeError(f"El Watcher no tiene la herramienta {name}.")
         self._mcp_id += 1
+        call_id = self._mcp_id
         waiter = asyncio.get_running_loop().create_future()
-        self._mcp_waiters[self._mcp_id] = waiter
-        await self.send(type="mcp", payload={"jsonrpc": "2.0", "method": "tools/call", "id": self._mcp_id,
+        self._mcp_waiters[call_id] = waiter
+        await self.send(type="mcp", payload={"jsonrpc": "2.0", "method": "tools/call", "id": call_id,
                                              "params": {"name": name, "arguments": arguments}})
         try:
             payload = await asyncio.wait_for(waiter, timeout)
         finally:
-            self._mcp_waiters.pop(self._mcp_id, None)
+            self._mcp_waiters.pop(call_id, None)
         if "error" in payload:
             raise RuntimeError(payload["error"].get("message", "error"))
         result = payload.get("result", {})
@@ -232,15 +236,29 @@ class Session:
 
     # --- server -> device -------------------------------------------------------------------
 
+    async def muted(self) -> bool:
+        """True when the Watcher's voice switch is off (firmware without it has none, and
+        speaks). If it can't be asked, assume it isn't."""
+        try:
+            status = json.loads(await self.call_tool("self.get_device_status", {}, timeout=3))
+            return not status["audio_speaker"].get("voice", True)
+        except (RuntimeError, asyncio.TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
+            log.warning("[%s] voice unknown (%s): speaking", self.device_id, e)
+            return False
+
     async def respond(self, text: str) -> None:
         queue: asyncio.Queue[tuple[str, list[bytes]] | None] = asyncio.Queue(maxsize=4)
         t0 = time.monotonic()
+        # Asked while the reply is being written: it's back long before the first sentence.
+        muted_task = asyncio.create_task(self.muted())
 
         async def produce() -> None:
             try:
                 async for kind, value in self.s.brain.reply(self.device_id, text):
                     if kind == "emotion":
                         await self.send(type="llm", emotion=value, text="")
+                    elif await muted_task:
+                        await queue.put((value, []))
                     else:
                         await queue.put((value, await self.s.speaker.frames(value)))
             finally:
@@ -257,6 +275,12 @@ class Session:
                     log.info("[%s] first audio after %.2fs", self.device_id, time.monotonic() - t0)
                     await self.send(type="tts", state="start")
                     started = True
+                if not frames:
+                    # Subtitles only: the previous one stays until it has been read.
+                    await asyncio.sleep(max(0.0, deadline - loop.time()))
+                    await self.send(type="tts", state="sentence_start", text=sentence)
+                    deadline = loop.time() + max(READ_MIN_S, READ_S_PER_CHAR * len(sentence))
+                    continue
                 await self.send(type="tts", state="sentence_start", text=sentence)
                 for frame in frames:
                     now = loop.time()
@@ -270,6 +294,7 @@ class Session:
             await asyncio.sleep(max(0.0, deadline - loop.time()))
         except asyncio.CancelledError:
             producer.cancel()
+            muted_task.cancel()
             raise
         except Exception:
             log.exception("[%s] reply failed", self.device_id)

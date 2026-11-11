@@ -36,7 +36,8 @@ Sin hora, sin iconos. Bixo aparece centrado y lo que le pasa al aparato se le no
 Sin conexión, busca el wifi con un icono tachado sobre la cabeza. Si le tocas, reacciona:
 contento, enamorado o muerto de risa si insistes. Mientras habláis tampoco hay textos de
 estado: mientras conecta le salen ondas de la cabeza, cuando escucha gira la cara para oírte,
-con la boca en «o», y si algo falla le sale una cruz roja encima. Solo se ven los subtítulos, en pixel art como todo lo demás.
+con la boca en «o», cuando habla mueve la boca, y si algo falla le sale una cruz roja encima. Solo se ven los subtítulos, en pixel art como todo lo demás: tres líneas sobre
+una franja sombreada bajo Bixo, que suben solas mientras habla.
 
 ### Fondos
 
@@ -50,20 +51,32 @@ Bixo, y se queda guardado.
 | Volumen | Menú | Brillo |
 |:---:|:---:|:---:|
 | <img src="docs/img/volume.png" width="220"> | <img src="docs/img/menu.png" width="220"> | <img src="docs/img/brightness.png" width="220"> |
-| Gira la rueda: un aro verde en el borde, lleno al 100 %. | Mantén el dedo en la pantalla. Se maneja con la rueda o tocando. | Un aro amarillo mientras lo ajustas. |
+| Gira la rueda: veinte segmentos verdes por el borde, uno por cada 5 %. | Mantén el dedo en la pantalla: iconos alrededor del borde y el nombre bajo Bixo. | Segmentos amarillos mientras lo ajustas. |
 
+- **Con subtítulos en pantalla,** la rueda (o el dedo, arrastrando) los sube y baja para
+  repasarlos, y no cambia el volumen; un clic o un toque fuera del texto los quita. Si no los
+  tocas, se van solos al acabar la respuesta: enseguida si la has oído, a los 6 s si solo la
+  has leído.
+- **Voz** (en el menú, apagada de serie): sin voz, Bixo contesta solo con subtítulos, y antes,
+  porque el servidor no tiene que sintetizar nada. Los sonidos siguen sonando.
 - **Doble pulsación** de la rueda: abre una conversación o la cierra.
 - **Una pulsación:** si escucha, envía lo que has dicho; si no, empieza a escuchar. Sin
   conexión, vuelve a buscar el wifi en ese momento.
 - **Un error** se quita solo a los pocos segundos, o antes tocando la pantalla o la rueda.
-- **Menú:** Brillo, Fondo, Nueva charla (olvida la conversación; lo que recuerda de ti se
-  queda), Wi-Fi, Reconectar wifi, Cambiar wifi, Restablecer (borra las redes wifi y los
-  ajustes, y vuelve a la configuración de red), Estado, Reiniciar, Apagar y Salir. Se cierra
-  solo a los 6 s sin usarlo, o tocando fuera de los botones.
+- **Menú:** once iconos alrededor del borde, sobre la pantalla en gris. La rueda va de uno a
+  otro y un clic lo elige; también se puede tocar el icono o su nombre. En el sentido del
+  reloj desde arriba: Salir, Voz, Brillo, Fondo, Nueva charla (olvida la conversación; lo que
+  recuerda de ti se queda), Reconectar, Cambiar wifi, Info (red, batería y versión),
+  Restablecer (borra las redes wifi y los ajustes, y vuelve a la configuración de red),
+  Reiniciar y Apagar. Lo que no se deshace pide una segunda pulsación: el icono se pone rojo y
+  sobre Bixo sale «Pulsa otra vez». Se cierra solo a los 6 s sin usarlo, o tocando fuera de
+  los iconos.
 - **Apagar** (desde el menú o manteniendo pulsada la rueda): con el cargador puesto no puede
-  cortar la corriente, así que solo apaga la pantalla; un clic, un giro o un toque la enciende.
-  Nunca se apaga solo: con batería, sin tocarlo, baja el brillo al minuto y apaga la pantalla a
-  los cinco; cualquier toque, giro o clic la despierta.
+  cortar la corriente, así que solo apaga la pantalla; un clic o un giro de la rueda la
+  enciende (tocar la pantalla no, para que no se despierte en el bolsillo).
+  Si sigues pulsando la rueda hasta los 10 s, se reinicia (la salida si se queda colgado).
+  Nunca se apaga solo, salvo con la batería al 5 %: con batería, sin tocarlo, baja el brillo
+  al minuto y apaga la pantalla a los cinco; la rueda la despierta.
 - **La cámara** se usa hablando: «¿qué ves?», «mira esto»… El modelo decide cuándo hacer la
   foto.
 - **No hay palabra de activación:** la conversación se abre con la rueda.
@@ -82,12 +95,14 @@ Todo lo propio está en [`main/boards/sensecap-watcher/`](main/boards/sensecap-w
 | Fichero | Qué hace |
 |---|---|
 | `sensecap_watcher.cc` | La placa: pantalla de mascota, táctil, rueda y menú |
-| `pet_ui.cc` / `pet_ui.h` | El aro de nivel y el menú |
+| `pet_ui.cc` / `pet_ui.h` | El aro de nivel, los subtítulos y el menú circular |
+| `pet_icons.c` / `pet_icons.h` | Los iconos, el disco y los segmentos del aro, generados por `server/tools/pet_icons.py` |
 | `pet_background.cc` / `pet_background.h` | Los fondos: los pinta por celdas y solo repinta las que cambian |
-| `font_pixel_16.c` | Press Start 2P a 16 px, la fuente de todos los textos |
+| `font_pixel_16.c` / `font_pixel_12.c` | Press Start 2P a 16 px (todos los textos) y a 12 px (el menú), generadas por `server/tools/pixel_font.py` |
 
-Fuera de esa carpeta (y de `server/`) solo cambia `Application::ToggleConversation()` (abrir o
-cerrar la conversación con la rueda). Del resto se han quitado las otras placas, los idiomas que no son
+Fuera de esa carpeta (y de `server/`) solo cambian `Application::ToggleConversation()` (abrir o
+cerrar la conversación con la rueda) y `Backlight` (el brillo se compara con el valor al que va,
+no con el del fundido a medias). Del resto se han quitado las otras placas, los idiomas que no son
 español o inglés, la documentación y las herramientas que el Watcher no usa.
 
 ## Compilar
