@@ -57,7 +57,13 @@ Bixo, y se queda guardado.
   conexión, vuelve a buscar el wifi en ese momento.
 - **Un error** se quita solo a los pocos segundos, o antes tocando la pantalla o la rueda.
 - **Menú:** Brillo, Fondo, Nueva charla (olvida la conversación; lo que recuerda de ti se
-  queda), Wi-Fi, Reconectar wifi, Cambiar wifi, Estado, Reiniciar, Apagar y Salir.
+  queda), Wi-Fi, Reconectar wifi, Cambiar wifi, Restablecer (borra las redes wifi y los
+  ajustes, y vuelve a la configuración de red), Estado, Reiniciar, Apagar y Salir. Se cierra
+  solo a los 6 s sin usarlo, o tocando fuera de los botones.
+- **Apagar** (desde el menú o manteniendo pulsada la rueda): con el cargador puesto no puede
+  cortar la corriente, así que solo apaga la pantalla; un clic, un giro o un toque la enciende.
+  Nunca se apaga solo: con batería, sin tocarlo, baja el brillo al minuto y apaga la pantalla a
+  los cinco; cualquier toque, giro o clic la despierta.
 - **La cámara** se usa hablando: «¿qué ves?», «mira esto»… El modelo decide cuándo hacer la
   foto.
 - **No hay palabra de activación:** la conversación se abre con la rueda.

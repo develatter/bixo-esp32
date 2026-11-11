@@ -367,7 +367,7 @@ private:
     PowerSaveTimer* power_save_timer_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
-    uint32_t long_press_cnt_;
+    std::atomic<bool> screen_off_{false};
     button_driver_t* btn_driver_ = nullptr;
     static SensecapWatcher* instance_;
     SscmaCamera* camera_ = nullptr;
@@ -379,6 +379,8 @@ private:
     std::unique_ptr<LevelRing> ring_;
     std::unique_ptr<PetMenu> menu_;
 
+    // Idle on battery, the screen dims after a minute and goes dark after five; any input wakes
+    // it. The Watcher never powers itself off: that is up to the user (or a flat battery).
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
@@ -386,28 +388,11 @@ private:
             GetBacklight()->SetBrightness(10);
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            screen_off_ = false;
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
-        power_save_timer_->OnShutdownRequest([this]() {
-            ESP_LOGI(TAG, "Shutting down");
-            bool is_charging = (IoExpanderGetLevel(BSP_PWR_VBUS_IN_DET) == 0);
-            if (is_charging) {
-                ESP_LOGI(TAG, "charging");
-                // Serialize with battery polling on the main task. USB may have
-                // disconnected by the time the request is handled.
-                Application::GetInstance().Schedule([this]() {
-                    power_save_timer_->SetEnabled(false);
-                    if (IoExpanderGetLevel(BSP_PWR_VBUS_IN_DET) == 0) {
-                        GetBacklight()->SetBrightness(0);
-                    } else {
-                        power_save_timer_->SetEnabled(true);
-                    }
-                });
-            } else {
-                IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);
-            }
-        });
+        power_save_timer_->OnShutdownRequest([this]() { TurnScreenOff(); });
         power_save_timer_->SetEnabled(true);
     }
 
@@ -505,10 +490,9 @@ private:
     void ApplyKnobSteps() {
         knob_scheduled_ = false;
         int steps = knob_steps_.exchange(0);
-        if (steps == 0) {
+        if (steps == 0 || WakeOnInput()) {
             return;
         }
-        power_save_timer_->WakeUp();
         if (MenuOpen()) {
             menu_->Move(steps);
             return;
@@ -554,7 +538,9 @@ private:
         
         iot_button_register_cb(btns, BUTTON_SINGLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<SensecapWatcher*>(usr_data);
-            self->power_save_timer_->WakeUp();
+            if (self->WakeOnInput()) {
+                return;
+            }
             if (self->MenuOpen()) {
                 Application::GetInstance().Schedule([self]() { self->menu_->Select(); });
                 return;
@@ -588,7 +574,9 @@ private:
         // Double click opens a conversation (listening) or hangs up the current one.
         iot_button_register_cb(btns, BUTTON_DOUBLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<SensecapWatcher*>(usr_data);
-            self->power_save_timer_->WakeUp();
+            if (self->WakeOnInput()) {
+                return;
+            }
             if (self->MenuOpen()) {
                 Application::GetInstance().Schedule([self]() { self->menu_->Close(); });
                 return;
@@ -604,27 +592,10 @@ private:
             Application::GetInstance().ToggleConversation();
         }, this);
         
+        // Holding the button powers off. There is no factory reset on the button: it is too easy
+        // to trigger while trying to switch off a plugged-in Watcher (see the factory_reset command).
         iot_button_register_cb(btns, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
-            auto self = static_cast<SensecapWatcher*>(usr_data);
-            bool is_charging = (self->IoExpanderGetLevel(BSP_PWR_VBUS_IN_DET) == 0);
-            self->long_press_cnt_ = 0;
-            if (is_charging) {
-                ESP_LOGI(TAG, "charging");
-            } else {
-                self->IoExpanderSetLevel(BSP_PWR_LCD, 0);
-                self->IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);
-            }
-        }, this);
-
-        iot_button_register_cb(btns, BUTTON_LONG_PRESS_HOLD, nullptr, [](void* button_handle, void* usr_data) {
-            auto self = static_cast<SensecapWatcher*>(usr_data);
-            self->long_press_cnt_++; // incremented every 20ms
-            // Long press for 10s to factory reset: 2+0.02*400 = 10
-            if (self->long_press_cnt_ > 400) {
-                ESP_LOGI(TAG, "Factory reset");
-                nvs_flash_erase();
-                esp_restart();
-            }
+            static_cast<SensecapWatcher*>(usr_data)->PowerOff();
         }, this);
     }
 
@@ -813,8 +784,7 @@ private:
             .func = NULL,
             .argtable = NULL,
             .func_w_context = [](void *context,int argc, char** argv) -> int {
-                nvs_flash_erase();
-                esp_restart();
+                FactoryReset();
                 return 0;
             },
             .context =this
@@ -1013,13 +983,14 @@ private:
 
     // A tap pets Bixo while it's idle: happy, then loving, then giggling if you keep at it.
     void OnTap(uint16_t x, uint16_t y) {
+        if (WakeOnInput()) {
+            return;
+        }
         if (MenuOpen()) {
-            power_save_timer_->WakeUp();
-            Application::GetInstance().Schedule([this, y]() { menu_->Tap(y); });
+            Application::GetInstance().Schedule([this, x, y]() { menu_->Tap(x, y); });
             return;
         }
         if (display_->ShowingError()) {
-            power_save_timer_->WakeUp();
             Application::GetInstance().Schedule([this]() { display_->DismissError(); });
             return;
         }
@@ -1027,7 +998,6 @@ private:
         tap_streak_ = (now - last_tap_us_ < 1500 * 1000) ? tap_streak_ + 1 : 0;
         last_tap_us_ = now;
         ESP_LOGI(TAG, "Tap at %u,%u (streak %d)", x, y, tap_streak_);
-        power_save_timer_->WakeUp();
         static const char* const kReactions[] = {"happy", "loving", "laughing"};
         const char* emotion = kReactions[tap_streak_ < 2 ? tap_streak_ : 2];
         Application::GetInstance().Schedule([this, emotion]() {
@@ -1049,7 +1019,9 @@ private:
 
     void OnLongPress() {
         ESP_LOGI(TAG, "Long press");
-        power_save_timer_->WakeUp();
+        if (WakeOnInput()) {
+            return;
+        }
         Application::GetInstance().Schedule([this]() {
             if (!menu_->IsOpen()) {
                 // The timer that would end a tap reaction is stopped: end it now.
@@ -1083,10 +1055,40 @@ private:
         }, "wifi_reconnect", 4096, this, 2, nullptr);
     }
 
+    // Erases the settings partition (wifi networks, volume, brightness, background) and restarts
+    // into wifi setup. The Watcher's own factory data lives in nvsfactory and is kept.
+    static void FactoryReset() {
+        ESP_LOGI(TAG, "Factory reset");
+        nvs_flash_erase();
+        esp_restart();
+    }
+
+    // With the charger plugged in the system rail can't be cut, so it only goes dark.
     void PowerOff() {
-        ESP_LOGI(TAG, "Power off from the menu");
+        if (IoExpanderGetLevel(BSP_PWR_VBUS_IN_DET) == 0) {
+            ESP_LOGI(TAG, "Power off while charging: screen off");
+            TurnScreenOff();
+            return;
+        }
+        ESP_LOGI(TAG, "Power off");
         IoExpanderSetLevel(BSP_PWR_LCD, 0);
-        IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);  // with the charger plugged in it stays on
+        IoExpanderSetLevel(BSP_PWR_SYSTEM, 0);
+    }
+
+    // A dark screen the next click, turn or touch lights up again.
+    void TurnScreenOff() {
+        screen_off_ = true;
+        GetBacklight()->SetBrightness(0);
+    }
+
+    // Every input goes through here first. Returns true when it only woke the screen up.
+    bool WakeOnInput() {
+        bool was_off = screen_off_.exchange(false);
+        power_save_timer_->WakeUp();
+        if (was_off) {
+            Application::GetInstance().Schedule([this]() { GetBacklight()->RestoreBrightness(); });
+        }
+        return was_off;
     }
 
     std::string NetworkInfo() {
@@ -1126,6 +1128,8 @@ private:
             {.kind = PetMenuItem::kInfo, .label = "Wi-Fi", .info = [this]() { return NetworkInfo(); }},
             {.kind = PetMenuItem::kAction, .label = "Reconectar wifi", .action = [this]() { ReconnectWifi(); }},
             {.kind = PetMenuItem::kConfirm, .label = "Cambiar wifi", .action = [this]() { EnterWifiConfigMode(); }},
+            {.kind = PetMenuItem::kConfirm, .label = "Restablecer", .action = []() { FactoryReset(); },
+             .warning = "Borra wifi y ajustes"},
             {.kind = PetMenuItem::kInfo, .label = "Estado", .info = [this]() { return StatusInfo(); }},
             {.kind = PetMenuItem::kConfirm, .label = "Reiniciar",
              .action = []() { Application::GetInstance().Reboot(); }},
@@ -1212,8 +1216,7 @@ public:
         discharging = !charging;
         level = (int)BatterygetPercent(false);
 
-        // Always synchronize, including the first snapshot and a short USB
-        // connection observed only by the shutdown callback. Re-enabling is a no-op.
+        // Dimming is for battery only; plugged in the screen stays at full brightness.
         power_save_timer_->SetEnabled(discharging);
         if (level <= 1  &&  discharging) {
             ESP_LOGI(TAG, "Battery level is low, shutting down");

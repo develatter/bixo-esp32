@@ -8,6 +8,7 @@
 #include <lvgl.h>
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,7 @@ struct PetMenuItem {
     std::function<std::vector<std::string>()> options = nullptr;  // kChoose
     std::function<void(bool)> choosing = nullptr;        // kChoose: entering, leaving
     std::function<std::string()> info = nullptr;          // kInfo
+    std::string warning;                                  // kConfirm: what it does, under "¿Seguro?"
     uint32_t color = 0xFFD65C;                            // kAdjust ring colour
 };
 
@@ -63,8 +65,8 @@ public:
     void Move(int steps);
     // Wheel click or a tap on the middle.
     void Select();
-    // A tap at screen row y.
-    void Tap(int y);
+    // A tap at (x, y). In the list and on "¿Seguro?", a tap off the pills closes the menu.
+    void Tap(int x, int y);
 
 private:
     enum class Mode { kList, kConfirm, kAdjust, kInfo, kChoose };
@@ -75,6 +77,8 @@ private:
     bool open_ = false;
     Mode mode_ = Mode::kList;
     int selected_ = 0;
+    int pill_w_ = 0;
+    int pill_h_ = 0;
     esp_timer_handle_t close_timer_ = nullptr;
 
     lv_obj_t* overlay_ = nullptr;
@@ -91,6 +95,8 @@ private:
     void Render();
     void KeepOpen();
     void LeaveChoosing();
+    // Which pill (x, y) falls on: -1 above, 0 the middle, 1 below; nullopt for none.
+    std::optional<int> PillAt(int x, int y) const;
     const PetMenuItem& Current() const { return items_[selected_]; }
 };
 

@@ -7,6 +7,7 @@
 #include <esp_log.h>
 
 #include <cmath>
+#include <cstdlib>
 
 #define TAG "pet_ui"
 
@@ -16,11 +17,12 @@ namespace {
 
 constexpr int kRingWidth = 10;
 constexpr int kRingHideMs = 1500;
-constexpr int kMenuCloseMs = 10000;
+constexpr int kMenuCloseMs = 6000;
 constexpr int kAdjustStep = 10;
 constexpr int kAdjustMin = 10;    // a black screen looks off
 constexpr int kRowGap = 92;       // px between the picker rows
-constexpr int kTapCentre = 60;    // taps closer than this to the middle select
+constexpr int kTapCentre = 60;    // adjusting: taps closer than this to the middle are done
+constexpr int kTapSlop = 12;      // px around a pill that still count as tapping it
 constexpr int kPixel = 4;         // the menu's "pixel": pill padding, line spacing
 
 // Bixo's palette (the same as his sprites).
@@ -169,6 +171,8 @@ void PetMenu::Build() {
     // label spans the pill so the text is centred whatever its length.
     int pill_w = LV_HOR_RES * 0.7 / kPixel * kPixel;
     int pill_h = font->line_height + 7 * kPixel;
+    pill_w_ = pill_w;
+    pill_h_ = pill_h;
     auto make_pill = [&](uint32_t fill, uint32_t text, int y, lv_obj_t** label) {
         lv_obj_t* pill = lv_obj_create(overlay_);
         lv_obj_remove_style_all(pill);
@@ -233,7 +237,11 @@ void PetMenu::Render() {
     switch (mode_) {
         case Mode::kConfirm:
             lv_label_set_text(current_label_, "¿Seguro?");
-            lv_label_set_text_fmt(hint_label_, "Pulsa otra vez: %s", Current().label.c_str());
+            if (Current().warning.empty()) {
+                lv_label_set_text_fmt(hint_label_, "Pulsa otra vez: %s", Current().label.c_str());
+            } else {
+                lv_label_set_text_fmt(hint_label_, "%s\nPulsa otra vez", Current().warning.c_str());
+            }
             break;
         case Mode::kAdjust:
             lv_label_set_text_fmt(current_label_, "%s %d %%", Current().label.c_str(), Current().get());
@@ -356,11 +364,46 @@ void PetMenu::LeaveChoosing() {
     }
 }
 
-void PetMenu::Tap(int y) {
-    int from_centre = y - LV_VER_RES / 2;
-    if (mode_ == Mode::kInfo || (from_centre > -kTapCentre && from_centre < kTapCentre)) {
-        Select();
-    } else {
-        Move(from_centre < 0 ? 1 : -1);
+std::optional<int> PetMenu::PillAt(int x, int y) const {
+    int dx = std::abs(x - LV_HOR_RES / 2);
+    if (dx > pill_w_ / 2 + kTapSlop) {
+        return std::nullopt;
+    }
+    for (int row = -1; row <= 1; row++) {
+        bool shown = row == 0 || (mode_ == Mode::kList && (row < 0 ? selected_ > 0
+                                                                  : selected_ + 1 < (int)items_.size()));
+        int dy = std::abs(y - (LV_VER_RES / 2 + row * kRowGap));
+        if (shown && dy <= pill_h_ / 2 + kTapSlop) {
+            return row;
+        }
+    }
+    return std::nullopt;
+}
+
+void PetMenu::Tap(int x, int y) {
+    switch (mode_) {
+        case Mode::kInfo:
+            Select();
+            return;
+        case Mode::kList:
+        case Mode::kConfirm: {
+            auto pill = PillAt(x, y);
+            if (!pill) {
+                Close();
+            } else if (*pill == 0) {
+                Select();
+            } else {
+                Move(-*pill);
+            }
+            return;
+        }
+        default: {  // adjusting or choosing: above the middle is up, below is down
+            int from_centre = y - LV_VER_RES / 2;
+            if (from_centre > -kTapCentre && from_centre < kTapCentre) {
+                Select();
+            } else {
+                Move(from_centre < 0 ? 1 : -1);
+            }
+        }
     }
 }
