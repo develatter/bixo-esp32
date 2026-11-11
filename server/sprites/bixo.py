@@ -104,8 +104,7 @@ class Canvas:
 GLYPHS = {
     "heart": ["pp.pp", "ppppp", ".ppp.", "..p.."],
     "heart_s": ["p.p", "ppp", ".p."],
-    "z": ["wwww", "..w.", ".w..", "wwww"],
-    "z_s": ["ww.", ".w.", ".ww"],
+    "z": ["www", "..w", ".w.", "w..", "www"],
     "q": [".ww.", "w..w", "..w.", ".w..", "....", ".w.."],
     "excl": ["g", "g", "g", ".", "g"],
     "dot": ["w"],
@@ -468,10 +467,11 @@ def anim_confident() -> Frames:
 
 
 def anim_sleepy() -> Frames:
+    """Breathing slowly, with two z's over his head bobbing a pixel, out of step."""
     frames: Frames = []
-    path = [("z_s", CX + 5, 6), ("z_s", CX + 6, 3), ("z", CX + 6, 1), None]  # rises and grows, then a gap
+    bob = (0, 0, 1, 1)
     for i in range(8):
-        zs = [z for z in (path[i % 4], path[(i + 2) % 4]) if z]
+        zs = [("z", CX + 1, 3 + bob[i % 4]), ("z", CX + 7, 1 + bob[(i + 2) % 4])]
         frames.append((p(shape="flat" if i % 4 >= 2 else "squash", eyes="closed", mouth="dot", extras=zs), 450))
     return frames
 
