@@ -414,7 +414,7 @@ def anim_surprised() -> Frames:
 
 def anim_shocked() -> Frames:
     face = dict(eyes="dot", mouth="o")
-    frames = [(p(shape="squash", eyes="open"), 100), (p(shape="stretch", dy=-4, extras=[("excl", CX - 2, 0), ("excl", CX + 1, 0)], **face), 120)]
+    frames = [(p(shape="squash", eyes="open"), 100), (p(shape="stretch", dy=-3, extras=[("excl", CX - 2, 1), ("excl", CX + 1, 1)], **face), 120)]
     for i in range(6):
         frames.append((p(shape="stretch", dx=(1 if i % 2 else -1), dy=-1, extras=[("excl", CX - 2, 1), ("excl", CX + 1, 1)], **face), 120))
     return frames + [(p(**face), 800)]
@@ -514,7 +514,7 @@ def anim_listening() -> Frames:
 def anim_connecting() -> Frames:
     """Reaching out to the server: eyes up, and waves rising from his head one after the other."""
     face = dict(look=(0, -1), mouth="dot")
-    near, far = ("wave_s", CX - 2, 4), ("wave", CX - 4, 0)
+    near, far = ("wave_s", CX - 2, 4), ("wave", CX - 4, 1)
     return [(p(**face), 300), (p(extras=[near], **face), 300), (p(extras=[near, far], **face), 300),
             (p(extras=[far], **face), 300), (p(**face), 200), (p(extras=[near], **face), 300),
             (p(extras=[near, far], **face), 300), (p(extras=[far], eyes="closed", **face), 110),
