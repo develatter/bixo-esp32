@@ -121,13 +121,16 @@ GLYPHS = {
     "cross": ["p...p", ".p.p.", "..p..", ".p.p.", "p...p"],
 }
 GLYPH_COLORS = {"p": "pink", "w": "white", "g": "gold", "t": "tear", "u": "puff"}
+# Saturated enough to read on any background; an outline only makes them heavy.
+UNOUTLINED = {"heart", "heart_s"}
 
 
 def glyph(c: Canvas, name: str, x: int, y: int) -> None:
-    """Off the body a glyph gets a dark outline, so it shows on light backgrounds too."""
+    """Off the body a glyph gets a dark outline, so it shows on light backgrounds too. Keep the
+    glyph a pixel inside the canvas, or that side of the outline is cut off."""
     cells = {(x + i, y + j): GLYPH_COLORS[ch] for j, row in enumerate(GLYPHS[name])
              for i, ch in enumerate(row) if ch != "."}
-    for (gx, gy) in cells:
+    for (gx, gy) in cells if name not in UNOUTLINED else ():
         for ox in (-1, 0, 1):
             for oy in (-1, 0, 1):
                 around = (gx + ox, gy + oy)
@@ -466,7 +469,7 @@ def anim_confident() -> Frames:
 
 def anim_sleepy() -> Frames:
     frames: Frames = []
-    path = [("z_s", CX + 5, 6), ("z_s", CX + 6, 3), ("z", CX + 7, 0), None]  # rises and grows, then a gap
+    path = [("z_s", CX + 5, 6), ("z_s", CX + 6, 3), ("z", CX + 6, 1), None]  # rises and grows, then a gap
     for i in range(8):
         zs = [z for z in (path[i % 4], path[(i + 2) % 4]) if z]
         frames.append((p(shape="flat" if i % 4 >= 2 else "squash", eyes="closed", mouth="dot", extras=zs), 450))
